@@ -1,5 +1,5 @@
 <#
-  install.ps1  —  一键安装打卡提醒工具（Windows）v7
+  install.ps1  —  一键安装打卡提醒工具（Windows）v8
   用法：powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
   或右键「使用 PowerShell 运行」。
   作用：
@@ -58,6 +58,30 @@ function Write-ConfigFile {
     $tmp = "$Path.tmp"
     $cfg | ConvertTo-Json | Set-Content -Path $tmp -Encoding UTF8
     Move-Item -Path $tmp -Destination $Path -Force
+}
+
+# R29: 杀旧实例后，旧进程的单实例 Mutex（ClockinReminder_$sid）可能还没释放，新实例 WaitOne(0) 失败会直接退出
+# → 装完没常驻进程。Start-Process 前轮询等待旧 Mutex 释放：最多 10 秒，每 0.5 秒试一次。
+# 探测到手立刻释放，让新实例能拿到；AbandonedMutexException（旧实例崩溃遗留）等同已释放。
+function Wait-InstanceMutexReleased {
+    param([string]$MutexName)
+    for ($i = 0; $i -lt 20; $i++) {   # 20 次 * 0.5s = 10s
+        $m = $null
+        try {
+            $m = New-Object System.Threading.Mutex($false, $MutexName)
+            if ($m.WaitOne(0)) {
+                $m.ReleaseMutex()
+                return $true
+            }
+        } catch {
+            # AbandonedMutexException：旧实例崩溃遗留，视为已释放
+            return $true
+        } finally {
+            if ($null -ne $m) { $m.Dispose() }
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
 }
 
 # 配置表单：确定返回写入的 config hashtable；取消/关闭返回 $null（用默认值，不写 config.json）
@@ -207,6 +231,9 @@ $cmd = 'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File 
 Set-ItemProperty -Path $runKey -Name 'ClockinReminder' -Value $cmd
 
 # 3. 立即启动
+# R29: 先等旧实例的单实例 Mutex 释放（最多 10 秒），再启动新实例，避免新实例 WaitOne(0) 失败退出
+try { $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { $sid = 'unknown' }
+$null = Wait-InstanceMutexReleased -MutexName "ClockinReminder_$sid"
 Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`""
 
 Write-Host ''

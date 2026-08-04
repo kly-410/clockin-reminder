@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  report.ps1  —  打卡时长统计报告（纯文本，不弹窗，v6）
+  report.ps1  —  打卡时长统计报告（纯文本，不弹窗，v8）
   用法（Windows PowerShell 5.1+）：
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1            # 本周（默认）
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Week
@@ -9,8 +9,8 @@
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Days 7
   说明：
     - 数据来自 %USERPROFILE%\.clockin-reminder\history.csv
-    - 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5）；offwork_actual 为空时回退 offwork_at（预计值）
-    - v5: offwork 时间只存 HH:mm；跨天（end < start）视为次日（与主脚本 Get-RecordEnd 一致）
+    - 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5 HH:mm / v8 完整 datetime）；offwork_actual 为空时回退 offwork_at（预计值）
+    - v8: offwork 时间存完整 datetime（含日期，下班可能次日）；旧 HH:mm 行走跨天推断 fallback（与主脚本 Get-RecordEnd 一致）
     - v6: 请假/全天缺勤行（上班/下班都空）显示 0h 0min (请假)，计入工作日占位（不拉高不拉低）
     - 周 = 周一~周日；工作日合计（周一~周五）用于 50h 达标，周末加班单列
     - 解析失败的行跳过并在末尾提示行号
@@ -76,22 +76,27 @@ function Get-RecordStart {
     return $null
 }
 
-# v5: offwork 时间 CSV 里只存 HH:mm；与 start 组合做跨天推断（end < start → +1 天，C1）；旧格式完整 datetime 仍兼容
+# v8: offwork 时间 CSV 里存完整 datetime（含日期，下班可能次日）→ 直接解析；旧 HH:mm 行走跨天推断 fallback（R28 兼容）
 function Get-RecordEnd {
     param($row, $start)
     $s = $row.offwork_actual
     if ([string]::IsNullOrWhiteSpace($s)) { $s = $row.offwork_at }
     if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    # v8 完整 datetime（含空格即有日期，可能次日）：直接解析
+    if ($s.Contains(' ')) {
+        $dt = [datetime]::MinValue
+        if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+        if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+        return $null
+    }
+    # v5 纯时间（HH:mm）：与 start 组合做跨天推断（end < start → +1 天，C1 fallback）
     $t = [datetime]::MinValue
     if ([datetime]::TryParseExact($s, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
         if ($null -eq $start) { return $null }
         $end = $start.Date.Add($t.TimeOfDay)
-        if ($end -lt $start) { $end = $end.AddDays(1) }   # C1: end < start → 视为次日
+        if ($end -lt $start) { $end = $end.AddDays(1) }
         return $end
     }
-    $dt = [datetime]::MinValue
-    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
-    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
     return $null
 }
 

@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v7)
+  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v8)
   功能：
     1. 工作日(周一~周五)才提醒；周六/周日不弹任何提醒、不写 history（R1）
     2. 8 点前不轮询（睡到 8:00）；主循环兜底 8:00-12:00 弹上班提醒；解锁/启动触发放宽到 8:00-23:00（R3/R4/R18）
@@ -13,7 +13,7 @@
     9. 配置持久化到 config.json；弹窗底部配置区先解锁才能改，保存后下次轮询生效（R21/R23）
   数据文件：%USERPROFILE%\.clockin-reminder\
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
-    history.csv  历史记录（日期,上班时间,预计下班,实际下班,工作时长；v5 起 offwork 时间只存 HH:mm）
+    history.csv  历史记录（日期,上班时间,预计下班,实际下班,工作时长；v8 起 offwork 时间存完整 datetime，可能次日）
     log.txt      异常日志
   运行：
     powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File clockin-reminder.ps1
@@ -211,7 +211,8 @@ function Write-State($state) {
 }
 
 # 写入历史前先去重：当天已有行则跳过（R9）
-# v5: 5 列，offwork_at 只存 HH:mm（去掉日期）；写上班卡时同时算 duration（缺实际下班回退预计 offwork_at）
+# v8: 5 列，offwork_at 存完整 datetime（state.offwork_at 本来就是 yyyy-MM-dd HH:mm:ss，直接写入，下班可能次日）
+#     写上班卡时同时算 duration（缺实际下班回退预计 offwork_at）
 function Add-HistoryLine {
     param([string]$date, [string]$clockin, [string]$offworkAt)
     Invoke-DataLocked {
@@ -220,7 +221,7 @@ function Add-HistoryLine {
                 Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
             }
             if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }
-            $offTime = ConvertTo-HHmm $offworkAt
+            $offTime = $offworkAt
             $durStr = ''
             $row = [pscustomobject]@{ date = $date; clockin = $clockin; offwork_at = $offTime; offwork_actual = '' }
             $min = Get-RecordMinutes $row
@@ -233,8 +234,8 @@ function Add-HistoryLine {
 }
 
 # ============ 历史统计（R10/R11）============
-# history.csv 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5）；offwork_actual 为空时回退 offwork_at（预计值）
-# v5: offwork_at / offwork_actual 在 CSV 里只存 HH:mm（日期由第一列 date 提供）；跨天推断见 Get-RecordEnd
+# history.csv 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5 HH:mm 版 / v8 完整 datetime 版）；offwork_actual 为空时回退 offwork_at（预计值）
+# v8: offwork_at / offwork_actual 在 CSV 里存完整 datetime（含日期，下班可能次日）；旧 HH:mm 行走跨天推断 fallback（见 Get-RecordEnd）
 
 # 读取 history.csv 为行对象数组；解析失败的行跳过并记行号（供 report 提示）
 function Read-HistoryRows {
@@ -296,25 +297,28 @@ function Get-RecordStart {
 }
 
 # 记录结束时间：优先 offwork_actual，为空回退 offwork_at（预计值）
-# v5: offwork 时间在 CSV 里只有 HH:mm → 与 start 同一天组合；若 end < start 视为跨天（+1 天，C1）
-#     旧格式（完整 yyyy-MM-dd HH:mm:ss，日期内嵌）仍兼容，无需跨天推断
+# v8: offwork 时间在 CSV 里存完整 datetime（yyyy-MM-dd HH:mm:ss，含日期，下班可能次日）→ 直接解析，无需推断
+#     旧 HH:mm 版行（无日期）→ 保留"end < start → 视为次日"推断作 fallback（R28 兼容）
 function Get-RecordEnd {
     param($row, $start)
     $s = $row.offwork_actual
     if ([string]::IsNullOrWhiteSpace($s)) { $s = $row.offwork_at }
     if ([string]::IsNullOrWhiteSpace($s)) { return $null }
-    # v5 纯时间（HH:mm）
+    # v8 完整 datetime（含空格即有日期，可能次日）：直接解析，无歧义
+    if ($s.Contains(' ')) {
+        $dt = [datetime]::MinValue
+        if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+        if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+        return $null
+    }
+    # v5 纯时间（HH:mm）：与 start 同一天组合；end < start 视为跨天（C1 fallback）
     $t = [datetime]::MinValue
     if ([datetime]::TryParseExact($s, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
         if ($null -eq $start) { return $null }
         $end = $start.Date.Add($t.TimeOfDay)
-        if ($end -lt $start) { $end = $end.AddDays(1) }   # C1: end < start → 视为次日
+        if ($end -lt $start) { $end = $end.AddDays(1) }
         return $end
     }
-    # 旧格式完整 datetime
-    $dt = [datetime]::MinValue
-    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
-    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
     return $null
 }
 
@@ -451,7 +455,7 @@ function Get-StateTodayMinutes {
 }
 
 # R10/R16: 下班确认后把实际确认时间写入 history.csv 对应行（offwork_actual 列，取最晚）
-# v5: offwork_actual 只存 HH:mm；确认后重算该行 duration 列（取最晚后时长可能变）
+# v8: offwork_actual 存完整 datetime（yyyy-MM-dd HH:mm:ss，可能次日）；确认后重算该行 duration 列（取最晚后时长可能变）
 function Set-HistoryOffworkActual {
     param([string]$date, [string]$actual)
     Invoke-DataLocked {
@@ -466,7 +470,7 @@ function Set-HistoryOffworkActual {
                     $c2 = if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' }
                     $c3 = if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' }
                     # R16: 同一天多次下班打卡只取最晚——已有更晚记录则跳过（写日志）
-                    # v5: 用跨天推断把已有 HH:mm 还原成完整 end 再比较（00:30 次日 > 23:50 当天）
+                    # v8: 新时间完整 datetime 直接与已有 end 比较；旧 HH:mm 行经跨天推断还原（00:30 次日 > 23:50 当天）
                     if (-not [string]::IsNullOrWhiteSpace($c3)) {
                         $exRow = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $c3 }
                         $exStart = Get-RecordStart $exRow
@@ -479,13 +483,12 @@ function Set-HistoryOffworkActual {
                             continue
                         }
                     }
-                    # v5: 只存 HH:mm；用 Get-RecordMinutes 重算 duration（优先 actual，空则回退 at）
-                    $actualHHmm = ConvertTo-HHmm $actual
+                    # v8: 存完整 datetime；用 Get-RecordMinutes 重算 duration（优先 actual，空则回退 at）
                     $durStr = ''
-                    $row = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $actualHHmm }
+                    $row = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $actual }
                     $min = Get-RecordMinutes $row
                     if ($null -ne $min) { $durStr = Format-RowDuration $min }
-                    $lines[$i] = "$date,$c1,$c2,$actualHHmm,$durStr"
+                    $lines[$i] = "$date,$c1,$c2,$actual,$durStr"
                     $changed = $true
                 }
             }
