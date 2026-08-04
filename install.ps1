@@ -14,8 +14,8 @@ $srcDir    = $PSScriptRoot
 $dstDir    = Join-Path $env:USERPROFILE '.clockin-reminder'
 $scriptPath = Join-Path $dstDir 'clockin-reminder.ps1'
 
-# 0. 停掉旧实例（按命令行匹配，避免重复实例双弹窗）
-Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+# 0. 停掉旧实例（按命令行匹配，避免重复实例双弹窗；兼容 powershell.exe 和 pwsh.exe）
+Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*clockin-reminder.ps1*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
