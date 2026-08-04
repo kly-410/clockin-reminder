@@ -6,15 +6,16 @@
     2. 8 点前不轮询（睡到 8:00）；主循环兜底 8:00-12:00 弹上班提醒；解锁/启动触发放宽到 8:00-23:00（R3/R4/R18）
     3. 上班/下班弹窗在独立 runspace 线程中运行，不阻塞主循环（R2）
     4. 打卡时间 + 10 小时后主循环弹下班提醒；跨天未确认的下班提醒在工作日补弹（R8）
-    5. 下班确认把实际时间写入 history.csv；下班弹窗附带今日/本周工作时长统计（R10/R12）
+    5. 下班确认把实际时间写入 log 周文件；下班弹窗附带今日/本周工作时长统计（R10/R12）
     6. 下班提醒循环触发：确认一次后按 ReRemindIntervalMinutes 再提醒，直到不再确认或超过 MaxRemindHour（R15/R17）
     7. offwork_actual 同一天多次确认取最晚（R16）
     8. 全天缺勤补记：工作日 20 点后无记录补 0h 0min；启动时补前一天 0h 0min（R19）
     9. 配置持久化到 config.json；弹窗底部配置区先解锁才能改，保存后下次轮询生效（R21/R23）
   数据文件：%USERPROFILE%\.clockin-reminder\
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
-    history.csv  历史记录（日期,上班时间,预计下班,实际下班,工作时长；v8 起 offwork 时间存完整 datetime，可能次日）
+    log\<周一日期>.csv  历史记录按周归档，每周一个文件（日期,上班时间,预计下班,实际下班,工作时长；v8 起 offwork 时间存完整 datetime，可能次日）
     log.txt      异常日志
+  根目录 history.csv 仅作旧数据迁移兼容读取，写入一律进 log 周文件（R28）
   运行：
     powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File clockin-reminder.ps1
 #>
@@ -36,7 +37,8 @@ $script:DefaultConfig = @{
 $script:DataDir     = Join-Path $env:USERPROFILE '.clockin-reminder'
 $script:ConfigFile  = Join-Path $script:DataDir 'config.json'
 $script:StateFile   = Join-Path $script:DataDir 'state.json'
-$script:HistoryFile = Join-Path $script:DataDir 'history.csv'
+$script:HistoryFile = Join-Path $script:DataDir 'history.csv'   # R28: 旧版单一文件，仅迁移兼容读取
+$script:LogDir      = Join-Path $script:DataDir 'log'           # R28: 历史记录按周归档 log\<周一日期>.csv
 $script:LogFile     = Join-Path $script:DataDir 'log.txt'
 
 # R21: 读 config.json → 合并后的 hashtable；缺失字段用默认值；文件不存在返回默认值
@@ -159,12 +161,27 @@ function Write-Log {
 # ============ 数据 ============
 function Ensure-DataDir {
     if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
-    if (-not (Test-Path $script:HistoryFile)) { Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8 }
+    # R28: 启动自动创建 log 目录（历史记录按周归档）
+    if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
     # P2-2: 清理原子写残留 .tmp（上次进程崩溃/被杀可能留下写一半的临时文件；正式文件 Move-Item 是原子的不受影响）
     foreach ($f in @($script:StateFile, $script:HistoryFile, $script:ConfigFile)) {
         $tmp = "$f.tmp"
         if (Test-Path $tmp) { Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue }
     }
+    if (Test-Path $script:LogDir) {
+        Get-ChildItem -Path $script:LogDir -Filter '*.tmp' -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# R28: 周文件路径 = date 所在周的周一日期 → log\<周一日期>.csv
+# 用于写入侧定位（当天记录写到当前周文件；缺勤补0写到对应日期所在周文件）
+function Get-WeekFile {
+    param([string]$dateStr)
+    $d = ConvertTo-StatsDate $dateStr
+    if ($null -eq $d) { $d = (Get-Date).Date }
+    $range = Get-WeekRange $d
+    return Join-Path $script:LogDir ($range.Monday.ToString('yyyy-MM-dd') + '.csv')
 }
 
 # P1-3: 数据文件互斥锁。主循环线程与弹窗 runspace 线程并发读写 history/state/config 会互相踩
@@ -213,20 +230,24 @@ function Write-State($state) {
 # 写入历史前先去重：当天已有行则跳过（R9）
 # v8: 5 列，offwork_at 存完整 datetime（state.offwork_at 本来就是 yyyy-MM-dd HH:mm:ss，直接写入，下班可能次日）
 #     写上班卡时同时算 duration（缺实际下班回退预计 offwork_at）
+# R28: 写入当天记录到 date 所在周文件（log\<周一日期>.csv）；文件不存在自动建（含中文表头）
 function Add-HistoryLine {
     param([string]$date, [string]$clockin, [string]$offworkAt)
     Invoke-DataLocked {
         try {
-            if (-not (Test-Path $script:HistoryFile)) {
-                Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
+            $weekFile = Get-WeekFile $date
+            $dir = Split-Path $weekFile -Parent
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            if (-not (Test-Path $weekFile)) {
+                Set-Content -Path $weekFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
             }
-            if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }
+            if (Select-String -Path $weekFile -Pattern "^$date," -Quiet) { return }
             $offTime = $offworkAt
             $durStr = ''
             $row = [pscustomobject]@{ date = $date; clockin = $clockin; offwork_at = $offTime; offwork_actual = '' }
             $min = Get-RecordMinutes $row
             if ($null -ne $min) { $durStr = Format-RowDuration $min }
-            Add-Content -Path $script:HistoryFile -Value "$date,$clockin,$offTime,,$durStr" -Encoding UTF8
+            Add-Content -Path $weekFile -Value "$date,$clockin,$offTime,,$durStr" -Encoding UTF8
         } catch {
             Write-Log "Add-HistoryLine 失败: $($_.Exception.Message)"
         }
@@ -234,12 +255,13 @@ function Add-HistoryLine {
 }
 
 # ============ 历史统计（R10/R11）============
-# history.csv 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5 HH:mm 版 / v8 完整 datetime 版）；offwork_actual 为空时回退 offwork_at（预计值）
+# 数据按周存 log\<周一日期>.csv，读取时合并全部周文件 + 根目录旧 history.csv（R28）。
+# 行兼容 3 列（旧）/4 列（v3/v4）/5 列（v5 HH:mm 版 / v8 完整 datetime 版）；offwork_actual 为空时回退 offwork_at（预计值）
 # v8: offwork_at / offwork_actual 在 CSV 里存完整 datetime（含日期，下班可能次日）；旧 HH:mm 行走跨天推断 fallback（见 Get-RecordEnd）
 
-# 读取 history.csv 为行对象数组；解析失败的行跳过并记行号（供 report 提示）
-function Read-HistoryRows {
-    param([string]$Path = $script:HistoryFile)
+# 读取单个 CSV 文件为行对象数组；解析失败的行跳过并记行号（供 report 提示）
+function Read-HistoryFile {
+    param([string]$Path)
     $rows = @()
     if (-not (Test-Path $Path)) { return $rows }
     $lines = @(Get-Content -Path $Path -Encoding UTF8)
@@ -261,6 +283,27 @@ function Read-HistoryRows {
             offwork_actual = $(if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' })
             duration       = $(if ($cols.Count -ge 5) { $cols[4].Trim() } else { '' })
         }
+    }
+    return $rows
+}
+
+# R28: 合并读取全部历史——log\*.csv 周文件（文件名=周一日期，按日期排序）+ 根目录旧 history.csv（迁移兼容）。
+# 只合并周数据文件（yyyy-MM-dd.csv）；跳过 week-*.csv 等非数据文件（旧导出格式，防止误解析进统计）。
+function Read-HistoryRows {
+    $rows = @()
+    $files = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:LogDir) -and (Test-Path $script:LogDir)) {
+        foreach ($f in @(Get-ChildItem -Path $script:LogDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            $fd = [datetime]::MinValue
+            if ([datetime]::TryParseExact($base, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$fd)) {
+                $null = $files.Add($f.FullName)
+            }
+        }
+    }
+    if (Test-Path $script:HistoryFile) { $null = $files.Add($script:HistoryFile) }
+    foreach ($f in @($files)) {
+        foreach ($row in @(Read-HistoryFile -Path $f)) { $rows += $row }
     }
     return $rows
 }
@@ -454,14 +497,21 @@ function Get-StateTodayMinutes {
     } catch { return $null }
 }
 
-# R10/R16: 下班确认后把实际确认时间写入 history.csv 对应行（offwork_actual 列，取最晚）
+# R10/R16: 下班确认后把实际确认时间写入对应周文件（offwork_actual 列，取最晚）
 # v8: offwork_actual 存完整 datetime（yyyy-MM-dd HH:mm:ss，可能次日）；确认后重算该行 duration 列（取最晚后时长可能变）
+# R28: 目标行在 date 所在周文件；找不到再全 log 扫（兼容历史数据位置）
 function Set-HistoryOffworkActual {
     param([string]$date, [string]$actual)
     Invoke-DataLocked {
         try {
-            if (-not (Test-Path $script:HistoryFile)) { return }
-            $lines = @(Get-Content -Path $script:HistoryFile -Encoding UTF8)
+            $weekFile = Get-WeekFile $date
+            if (-not (Test-Path $weekFile) -and -not [string]::IsNullOrWhiteSpace([string]$script:LogDir) -and (Test-Path $script:LogDir)) {
+                foreach ($f in @(Get-ChildItem -Path $script:LogDir -Filter '*.csv' -File -ErrorAction SilentlyContinue)) {
+                    if (Select-String -Path $f.FullName -Pattern "^$date," -Quiet) { $weekFile = $f.FullName; break }
+                }
+            }
+            if (-not (Test-Path $weekFile)) { return }
+            $lines = @(Get-Content -Path $weekFile -Encoding UTF8)
             $changed = $false
             for ($i = 1; $i -lt $lines.Count; $i++) {
                 $cols = $lines[$i].Split(',')
@@ -493,9 +543,9 @@ function Set-HistoryOffworkActual {
                 }
             }
             if ($changed) {
-                $tmp = "$($script:HistoryFile).tmp"
+                $tmp = "$weekFile.tmp"
                 $lines | Set-Content -Path $tmp -Encoding UTF8
-                Move-Item -Path $tmp -Destination $script:HistoryFile -Force
+                Move-Item -Path $tmp -Destination $weekFile -Force
             }
         } catch {
             Write-Log "Set-HistoryOffworkActual 失败: $($_.Exception.Message)"
@@ -929,6 +979,8 @@ function Start-DialogRunspace {
         $null = $ps.AddScript("function Set-HistoryOffworkActual { $((Get-Command -Name 'Set-HistoryOffworkActual').Definition) }")
         $null = $ps.AddScript("function ConvertTo-HHmm { $((Get-Command -Name 'ConvertTo-HHmm').Definition) }")
         $null = $ps.AddScript("function ConvertTo-StatsDate { $((Get-Command -Name 'ConvertTo-StatsDate').Definition) }")
+        $null = $ps.AddScript("function Get-WeekRange { $((Get-Command -Name 'Get-WeekRange').Definition) }")
+        $null = $ps.AddScript("function Get-WeekFile { $((Get-Command -Name 'Get-WeekFile').Definition) }")
         $null = $ps.AddScript("function Get-RecordStart { $((Get-Command -Name 'Get-RecordStart').Definition) }")
         $null = $ps.AddScript("function Get-RecordEnd { $((Get-Command -Name 'Get-RecordEnd').Definition) }")
         $null = $ps.AddScript("function Get-RecordMinutes { $((Get-Command -Name 'Get-RecordMinutes').Definition) }")
@@ -949,6 +1001,7 @@ Add-Type -AssemblyName System.Drawing
 $script:DataDir      = $ctx.DataDir
 $script:StateFile    = $ctx.StateFile
 $script:HistoryFile  = $ctx.HistoryFile
+$script:LogDir       = $ctx.LogDir
 $script:LogFile      = $ctx.LogFile
 $script:ConfigFile   = $ctx.ConfigFile
 $script:DefaultConfig = $ctx.DefaultConfig
@@ -1015,6 +1068,7 @@ try {
             DataDir = $script:DataDir
             StateFile = $script:StateFile
             HistoryFile = $script:HistoryFile
+            LogDir = $script:LogDir
             LogFile = $script:LogFile
             ConfigFile = $script:ConfigFile
             DefaultConfig = $script:DefaultConfig
@@ -1141,15 +1195,19 @@ function Invoke-OffWorkCheck {
 
 # ============ 全天缺勤补记 0 时长（R19）============
 # 补 0 时长行：date,,,,0h 0min（上班/下班空，工作时长 0h 0min）；当天已有行则跳过（去重，防重复补）
+# R28: 写到对应日期所在周文件（date 所在周的 log\<周一日期>.csv）
 function Add-AbsenceLine {
     param([string]$date)
     Invoke-DataLocked {
         try {
-            if (-not (Test-Path $script:HistoryFile)) {
-                Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
+            $weekFile = Get-WeekFile $date
+            $dir = Split-Path $weekFile -Parent
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            if (-not (Test-Path $weekFile)) {
+                Set-Content -Path $weekFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
             }
-            if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }   # 去重：已有行不重复补
-            Add-Content -Path $script:HistoryFile -Value "$date,,,,0h 0min" -Encoding UTF8
+            if (Select-String -Path $weekFile -Pattern "^$date," -Quiet) { return }   # 去重：已有行不重复补
+            Add-Content -Path $weekFile -Value "$date,,,,0h 0min" -Encoding UTF8
             Write-Log "补记缺勤：$date 0h 0min"
         } catch {
             Write-Log "Add-AbsenceLine 失败: $($_.Exception.Message)"

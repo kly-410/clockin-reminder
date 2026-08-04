@@ -8,7 +8,7 @@
     - 选「记上班卡」或「记下班卡」，填时间（HH:mm，默认当前时间），点按钮写入
     - 记下班卡取最晚（R16）：当天已有下班记录时，新时间更晚才确认更新；更早则提示跳过
     - 当天该类型已有记录时弹 YesNo 确认覆盖；没有则新增一行
-    - 数据写入同一个 history.csv（日期,上班时间,预计下班,实际下班,工作时长；v8 起下班时间存完整 datetime，跨天加班到次日日期 +1）
+    - 数据写入 log 周文件（log\<周一日期>.csv；日期,上班时间,预计下班,实际下班,工作时长；v8 起下班时间存完整 datetime，跨天加班到次日日期 +1）
     - 周末/任意时间记录计入周/月统计的「周末加班」单列，不参与 50h 达标判断
     - 普通窗口、可关闭；不触发主脚本任何提醒（主脚本 Test-Workday 守卫不变）
 #>
@@ -17,12 +17,13 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $script:DataDir      = Join-Path $env:USERPROFILE '.clockin-reminder'
-$script:HistoryFile  = Join-Path $script:DataDir 'history.csv'
+$script:HistoryFile  = Join-Path $script:DataDir 'history.csv'   # R28: 旧版单一文件，仅迁移兼容读取
+$script:LogDir       = Join-Path $script:DataDir 'log'           # R28: 历史记录按周归档 log\<周一日期>.csv
 $script:SkippedLines = New-Object System.Collections.ArrayList
 
-# ============ 历史读写（与主脚本一致：兼容 3 列/4 列/5 列）============
-function Read-HistoryRows {
-    param([string]$Path = $script:HistoryFile)
+# ============ 历史读写（与主脚本一致：兼容 3 列/4 列/5 列；R28 合并读 log 周文件）============
+function Read-HistoryFile {
+    param([string]$Path)
     $rows = @()
     if (-not (Test-Path $Path)) { return $rows }
     $lines = @(Get-Content -Path $Path -Encoding UTF8)
@@ -46,6 +47,43 @@ function Read-HistoryRows {
         }
     }
     return $rows
+}
+
+# R28: 合并读取全部历史——log\*.csv 周文件（文件名=周一日期，按日期排序）+ 根目录旧 history.csv（迁移兼容）
+function Read-HistoryRows {
+    $rows = @()
+    $files = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:LogDir) -and (Test-Path $script:LogDir)) {
+        foreach ($f in @(Get-ChildItem -Path $script:LogDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            $fd = [datetime]::MinValue
+            if ([datetime]::TryParseExact($base, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$fd)) {
+                $null = $files.Add($f.FullName)
+            }
+        }
+    }
+    if (Test-Path $script:HistoryFile) { $null = $files.Add($script:HistoryFile) }
+    foreach ($f in @($files)) {
+        foreach ($row in @(Read-HistoryFile -Path $f)) { $rows += $row }
+    }
+    return $rows
+}
+
+# R28: 所在周的周一/周日（周一到周日）
+function Get-WeekRange {
+    param([datetime]$d)
+    $daysSinceMonday = ([int]$d.DayOfWeek + 6) % 7
+    $monday = $d.Date.AddDays(-$daysSinceMonday)
+    return @{ Monday = $monday; Sunday = $monday.AddDays(6) }
+}
+
+# R28: 周文件路径 = date 所在周的周一日期 → log\<周一日期>.csv
+function Get-WeekFile {
+    param([string]$dateStr)
+    $d = ConvertTo-StatsDate $dateStr
+    if ($null -eq $d) { $d = (Get-Date).Date }
+    $range = Get-WeekRange $d
+    return Join-Path $script:LogDir ($range.Monday.ToString('yyyy-MM-dd') + '.csv')
 }
 
 # ============ 时长计算（与主脚本一致：跨天推断 C1）============
@@ -144,12 +182,16 @@ function New-OffworkDateTime {
 
 # 写入/覆盖当天记录：kind = 'clockin'（上班，写 HH:mm）/ 'offwork'（下班，写完整 datetime，可能次日）
 # v8: 5 列，offwork 时间存完整 datetime；写入时重算该行 duration 列（优先 actual，空则回退 at）
+# R28: 写入 date 所在周文件（log\<周一日期>.csv）；文件不存在自动建（含中文表头）
 function Set-ManualRecord {
     param([string]$date, [string]$kind, [string]$timeValue)
     try {
+        $weekFile = Get-WeekFile $date
+        $dir = Split-Path $weekFile -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $lines = @()
-        if (Test-Path $script:HistoryFile) {
-            $lines = @(Get-Content -Path $script:HistoryFile -Encoding UTF8)
+        if (Test-Path $weekFile) {
+            $lines = @(Get-Content -Path $weekFile -Encoding UTF8)
         }
         if ($lines.Count -eq 0) {
             $lines = @('日期,上班时间,预计下班,实际下班,工作时长')
@@ -180,9 +222,9 @@ function Set-ManualRecord {
             }
         }
         # 原子写
-        $tmp = "$($script:HistoryFile).tmp"
+        $tmp = "$weekFile.tmp"
         $lines | Set-Content -Path $tmp -Encoding UTF8
-        Move-Item -Path $tmp -Destination $script:HistoryFile -Force
+        Move-Item -Path $tmp -Destination $weekFile -Force
         return $true
     } catch {
         try { [System.Windows.Forms.MessageBox]::Show("写入失败：$($_.Exception.Message)", '错误', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null } catch { }

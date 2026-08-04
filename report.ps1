@@ -26,7 +26,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $script:DataDir      = Join-Path $env:USERPROFILE '.clockin-reminder'
-$script:HistoryFile  = Join-Path $script:DataDir 'history.csv'
+$script:HistoryFile  = Join-Path $script:DataDir 'history.csv'          # 旧单文件（兼容，若存在也合并读）
+$script:LogDir       = Join-Path $script:DataDir 'log'                  # v8: 周文件目录
 $script:SkippedLines = New-Object System.Collections.ArrayList
 
 # ============ 历史读取与解析（与主脚本一致）============

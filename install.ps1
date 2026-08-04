@@ -9,6 +9,7 @@
     3. 立即启动常驻脚本
   说明：report.ps1 不用安装，拷到任意目录命令行运行即可（数据读 %USERPROFILE%\.clockin-reminder\）
   R22：安装前先弹 WinForms 配置表单；预填已存在的 config.json（重装时保留当前配置）
+  R30：启动新实例后轮询 3 秒确认进程存活（旧 Mutex 未释放导致新实例退出的问题）
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -79,6 +80,18 @@ function Wait-InstanceMutexReleased {
         } finally {
             if ($null -ne $m) { $m.Dispose() }
         }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+# R30: Start-Process 后轮询 3 秒确认常驻进程真的存活（即使 Mutex 已释放，仍有其他原因导致新实例启动即退）。
+# 用命令行匹配 clockin-reminder.ps1（兼容 powershell.exe / pwsh.exe）。
+function Confirm-ProcessAlive {
+    for ($i = 0; $i -lt 6; $i++) {   # 6 次 * 0.5s = 3s
+        $running = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*clockin-reminder.ps1*' })
+        if ($running.Count -gt 0) { return $true }
         Start-Sleep -Milliseconds 500
     }
     return $false
@@ -236,8 +249,14 @@ try { $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value } cat
 $null = Wait-InstanceMutexReleased -MutexName "ClockinReminder_$sid"
 Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`""
 
-Write-Host ''
-Write-Host '[OK] 打卡提醒工具已安装并启动' -ForegroundColor Green
+# R30: 启动后轮询 3 秒确认进程存活（旧 Mutex 未释放导致新实例退出的问题）
+if (Confirm-ProcessAlive) {
+    Write-Host ''
+    Write-Host '[OK] 打卡提醒工具已安装并启动' -ForegroundColor Green
+} else {
+    Write-Host ''
+    Write-Host '[警告] 未检测到常驻进程（可能启动即退出），请查看 log.txt' -ForegroundColor Yellow
+}
 Write-Host "  脚本目录 : $dstDir"
 Write-Host '  配置文件 : config.json（弹窗底部「解锁更改配置」可再次修改）'
 Write-Host '  手动打卡 : 双击 manual-clockin.ps1（周末加班记录）'
