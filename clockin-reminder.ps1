@@ -163,14 +163,14 @@ function Get-RecordMinutes {
     return $diff.TotalMinutes
 }
 
-# 时长显示：Xh Ym（如 10h 05m）
+# 时长显示：Xh Ymin（如 3h 30min）
 function Format-Duration {
     param([double]$Minutes)
     if ($Minutes -lt 0) { $Minutes = 0 }
     $total = [math]::Round($Minutes)
     $h = [math]::Floor($total / 60)
     $m = $total % 60
-    return ('{0}h {1:00}m' -f $h, $m)
+    return ('{0}h {1}min' -f $h, $m)
 }
 
 function Test-Weekend {

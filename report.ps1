@@ -99,7 +99,7 @@ function Format-Duration {
     $total = [math]::Round($Minutes)
     $h = [math]::Floor($total / 60)
     $m = $total % 60
-    return ('{0}h {1:00}m' -f $h, $m)
+    return ('{0}h {1}min' -f $h, $m)
 }
 
 function Test-Weekend {
