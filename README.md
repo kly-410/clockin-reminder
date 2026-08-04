@@ -119,6 +119,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹�
 3. 快速验证：把主脚本里 `$script:WorkWindowStart = 8` 改成 `0`、`$script:OffWorkHours = 10` 改成 `0.05`（3 分钟），
    重跑 `install.ps1` → 立即弹上班提醒，填时间后 3 分钟弹下班提醒。验完改回。
 
+## 每周 CSV（log 文件夹）
+
+用 `report.ps1 -Save`（或双击 `report-gui.bat`）时，自动生成 `%USERPROFILE%\.clockin-reminder\log\week-<年>-W<周>.csv`：
+
+- 文件名按 ISO 周：`week-2026-W32.csv`，历史每周一个文件，可追溯
+- 内容：
+  - **本周每天明细**：日期、星期、上班时间、预计下班、实际下班、工作时长（6 列，Excel 直接打开）
+  - **周统计**：工作日合计（50h 达标判断 ✅/⚠️）、周末加班、本周总计
+  - **本月累计**：本月工作日 / 加班 / 合计（满足"包含该月已有数据"）
+- 周末没打卡的日子显示空行；全天缺勤显示 `0h 0min`
+
 ## 常见问题
 
 - **弹窗没出现**：确认任务管理器里有 `powershell.exe`（无窗口）在跑；没有就跑一次 `install.ps1`；再看 `log.txt`
