@@ -1,14 +1,15 @@
 #Requires -Version 5.1
 <#
-  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v5)
+  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v6)
   功能：
     1. 工作日(周一~周五)才提醒；周六/周日不弹任何提醒、不写 history（R1）
-    2. 8 点前不轮询（睡到 8:00）；8:00-12:00 之间由主循环兜底弹上班提醒（R3/R4）
+    2. 8 点前不轮询（睡到 8:00）；主循环兜底 8:00-12:00 弹上班提醒；解锁/启动触发放宽到 8:00-23:00（R3/R4/R18）
     3. 上班/下班弹窗在独立 runspace 线程中运行，不阻塞主循环（R2）
     4. 打卡时间 + 10 小时后主循环弹下班提醒；跨天未确认的下班提醒在工作日补弹（R8）
     5. 下班确认把实际时间写入 history.csv；下班弹窗附带今日/本周工作时长统计（R10/R12）
     6. 下班提醒循环触发：确认一次后按 ReRemindIntervalMinutes 再提醒，直到不再确认或超过 MaxRemindHour（R15/R17）
     7. offwork_actual 同一天多次确认取最晚（R16）
+    8. 全天缺勤补记：工作日 20 点后无记录补 0h 0min；启动时补前一天 0h 0min（R19）
   数据文件：%USERPROFILE%\.clockin-reminder\
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
     history.csv  历史记录（日期,上班时间,预计下班,实际下班,工作时长；v5 起 offwork 时间只存 HH:mm）
@@ -24,7 +25,7 @@ Add-Type -AssemblyName System.Drawing
 # ============ 配置 ============
 $script:OffWorkHours      = 10            # 上班打卡后多少小时提醒下班
 $script:WorkWindowStart   = 8             # 上班提醒最早时间（8 点）
-$script:WorkWindowEnd     = 10            # 打卡时间最晚（提示用；超范围弹 YesNo 确认，不再硬拒）
+$script:WorkWindowEnd     = 10            # 打卡时间最晚（提示用；超范围弹 YesNo 确认，不再硬拒；R18 起上限放宽到 max(10, 当前时刻)）
 $script:WorkAutoPopupEnd  = 12            # 上班自动提醒最晚时间（12 点后启动当天不自动弹）
 $script:SkipWeekend       = $true         # 周六/周日不提醒、不写历史
 $script:ReRemindIntervalMinutes = 30      # 满 10h 后默认每 30 分钟再弹一次（R15）
@@ -390,10 +391,36 @@ function Test-Workday {
     return ($dow -ne [DayOfWeek]::Saturday) -and ($dow -ne [DayOfWeek]::Sunday)
 }
 
-# 上班自动提醒时间窗：8:00 <= now < 12:00（R3 每天 8 点兜底 / R4 深夜启动不弹）
+# 上班自动提醒时间窗（R18）：主循环兜底保持 8:00-12:00（防深夜重装误弹）；解锁/启动触发 -AllowLate 放宽到 8:00-23:00
 function Test-WorkAutoWindow {
+    param([bool]$AllowLate = $false)
     $hour = (Get-Date).Hour
+    if ($AllowLate) {
+        return ($hour -ge $script:WorkWindowStart) -and ($hour -lt 23)
+    }
     return ($hour -ge $script:WorkWindowStart) -and ($hour -lt $script:WorkAutoPopupEnd)
+}
+
+# R18: 打卡时间上限小时 = max(WorkWindowEnd, 当前小时)；下午到的人可填 14:00
+function Get-WorkEndHour {
+    $h = (Get-Date).Hour
+    if ($h -lt $script:WorkWindowEnd) { return $script:WorkWindowEnd }
+    return $h
+}
+
+# R18: 打卡时间是否在允许范围：不早于 WorkStart:00，不晚于 max(WorkEnd:00, 当前时刻)。
+# 下午到的人填 14:00（= 当前时刻）不再被拦；超范围保留弹窗 YesNo 确认逻辑（R9）。
+# 返回 @{ InRange; MinStr; MaxStr }；时间格式错误返回 $null（弹窗已先做过格式校验）。
+function Test-ClockinTimeRange {
+    param([string]$HHmm, [int]$WorkStart = $script:WorkWindowStart, [int]$WorkEnd = $script:WorkWindowEnd)
+    $t = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($HHmm, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) { return $null }
+    $val = [datetime]::Today.AddHours($t.Hour).AddMinutes($t.Minute)
+    $min = [datetime]::Today.AddHours($WorkStart)
+    $max = [datetime]::Today.AddHours($WorkEnd)
+    $now = Get-Date
+    if ($now -gt $max) { $max = $now }
+    return @{ InRange = ($val -ge $min -and $val -le $max); MinStr = $min.ToString('H:mm'); MaxStr = $max.ToString('H:mm') }
 }
 
 # ============ 锁屏检测（R7，WTS API）============
@@ -526,13 +553,12 @@ function Show-MandatoryDialog {
                 [System.Windows.Forms.MessageBox]::Show('时间格式不对，请填 HH:mm 或 H:mm，例如 08:30 或 8:30', '输入错误') | Out-Null
                 return
             }
-            $val = [datetime]::Today.AddHours($t.Hour).AddMinutes($t.Minute)
-            $min = [datetime]::Today.AddHours($tag.WorkStart)
-            $max = [datetime]::Today.AddHours($tag.WorkEnd)
-            if ($val -lt $min -or $val -gt $max) {
-                # 超范围不再硬拒，弹 YesNo 让用户决定（R9）
+            $range = Test-ClockinTimeRange -HHmm $text -WorkStart $tag.WorkStart -WorkEnd $tag.WorkEnd
+            if ($null -eq $range) { return }   # 格式错误（上方已校验，理论上不会到这）
+            if (-not $range.InRange) {
+                # 超范围不再硬拒，弹 YesNo 让用户决定（R9/R18）
                 $ask = [System.Windows.Forms.MessageBox]::Show(
-                    "实际时间 $text 不在 $($tag.WorkStart):00-$($tag.WorkEnd):00，仍要记录？",
+                    "实际时间 $text 不在 $($range.MinStr)-$($range.MaxStr)，仍要记录？",
                     '确认', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
                 if ($ask -ne [System.Windows.Forms.DialogResult]::Yes) { return }
             }
@@ -579,7 +605,8 @@ function Start-DialogRunspace {
         [string]$Message,
         [string]$SubMessage = '',
         [string]$InputDefault = '',
-        [string]$ExpectedOffworkAt = ''  # 下班弹窗确认时校验，防止旧弹窗串改新一天数据
+        [string]$ExpectedOffworkAt = '',  # 下班弹窗确认时校验，防止旧弹窗串改新一天数据
+        [int]$WorkEnd = $script:WorkWindowEnd   # R18: 打卡时间上限（提示用；下午到放宽到当前时刻）
     )
 
     try {
@@ -603,6 +630,7 @@ function Start-DialogRunspace {
         $null = $ps.AddScript("function Get-RecordEnd { $((Get-Command -Name 'Get-RecordEnd').Definition) }")
         $null = $ps.AddScript("function Get-RecordMinutes { $((Get-Command -Name 'Get-RecordMinutes').Definition) }")
         $null = $ps.AddScript("function Format-Duration { $((Get-Command -Name 'Format-Duration').Definition) }")
+        $null = $ps.AddScript("function Test-ClockinTimeRange { $((Get-Command -Name 'Test-ClockinTimeRange').Definition) }")
         $null = $ps.AddScript("function Invoke-OffworkConfirm { $((Get-Command -Name 'Invoke-OffworkConfirm').Definition) }")
         $null = $ps.AddScript("function Write-Log { $((Get-Command -Name 'Write-Log').Definition) }")
 
@@ -665,7 +693,7 @@ try {
             WithInput = ($Kind -eq 'work')
             InputDefault = $InputDefault
             WorkWindowStart = $script:WorkWindowStart
-            WorkWindowEnd = $script:WorkWindowEnd
+            WorkWindowEnd = $WorkEnd
             OffWorkHours = $script:OffWorkHours
             ReRemindIntervalMinutes = $script:ReRemindIntervalMinutes
             SkipWeekend = $script:SkipWeekend
@@ -697,10 +725,11 @@ function Cleanup-DialogRunspaces {
     }
 }
 
-# ============ 上班打卡流程（异步弹窗；R1/R2/R3/R4 守卫）============
+# ============ 上班打卡流程（异步弹窗；R1/R2/R3/R4 守卫；R18 解锁/启动放宽）============
 function Invoke-WorkReminder {
+    param([bool]$AllowLate = $false)          # R18: 解锁/启动触发传 $true，时间窗放宽到 8:00-23:00
     if (-not (Test-Workday)) { return }                    # R1 周末守卫
-    if (-not (Test-WorkAutoWindow)) { return }             # R3/R4 仅 8:00-12:00 才自动弹
+    if (-not (Test-WorkAutoWindow -AllowLate $AllowLate)) { return }   # R3/R4 兜底 8-12；R18 解锁/启动放宽
     $state = Read-State
     $today = (Get-Date).ToString('yyyy-MM-dd')
     if ($state -and $state.work_reminder_shown -and $state.date -eq $today) { return }  # 已提醒过
@@ -714,10 +743,18 @@ function Invoke-WorkReminder {
 
     $now = Get-Date
     $statLine = Get-StatsSummaryLine
+    $endHour = Get-WorkEndHour
+    if ($now.Hour -ge 12) {
+        # R18: 下午到/迟到，提示如实填写实际打卡时间（可填 14:00）
+        $subMsg = "迟到/下午到，如实填写实际打卡时间（$($script:WorkWindowStart):00-$($now.ToString('H:mm'))）"
+    } else {
+        $subMsg = "填写实际打卡时间（$($script:WorkWindowStart):00-$endHour:00）"
+    }
     Start-DialogRunspace -Kind 'work' -Title '上班打卡提醒' `
         -Message "记得飞书打卡上班！`n$statLine" `
-        -SubMessage "填写实际打卡时间（$($script:WorkWindowStart):00 - $($script:WorkWindowEnd):00）" `
-        -InputDefault $now.ToString('HH:mm')
+        -SubMessage $subMsg `
+        -InputDefault $now.ToString('HH:mm') `
+        -WorkEnd $endHour
 }
 
 # ============ 下班检查（主循环调用；跨天补弹 R8；周末守卫 R1；异步弹窗 R2；加班循环 R15）============
@@ -779,6 +816,34 @@ function Invoke-OffWorkCheck {
         -ExpectedOffworkAt $baseRaw
 }
 
+# ============ 全天缺勤补记 0 时长（R19）============
+# 补 0 时长行：date,,,,0h 0min（上班/下班空，工作时长 0h 0min）；当天已有行则跳过（去重，防重复补）
+function Add-AbsenceLine {
+    param([string]$date)
+    try {
+        if (-not (Test-Path $script:HistoryFile)) {
+            Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
+        }
+        if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }   # 去重：已有行不重复补
+        Add-Content -Path $script:HistoryFile -Value "$date,,,,0h 0min" -Encoding UTF8
+        Write-Log "补记缺勤：$date 0h 0min"
+    } catch {
+        Write-Log "Add-AbsenceLine 失败: $($_.Exception.Message)"
+    }
+}
+
+# 主循环调用：当天 20 点后无记录 → 补当天 0h 0min（白天还在上班不判；周末没去也补 0，用户要求）
+function Invoke-AbsenceCheck {
+    if ((Get-Date).Hour -lt 20) { return }         # 20 点前不算"今天没来"
+    Add-AbsenceLine -date (Get-Date).ToString('yyyy-MM-dd')
+}
+
+# 启动时调用：昨天无记录 → 补昨天 0h 0min（整天没开电脑漏记；周末没去也补 0）
+function Invoke-AbsenceBackfill {
+    $yesterday = (Get-Date).Date.AddDays(-1)
+    Add-AbsenceLine -date $yesterday.ToString('yyyy-MM-dd')
+}
+
 # ============ 单实例互斥（R6）============
 # 用户级命名 Mutex（不用 Global\，避免权限问题）；已有实例直接退出
 try {
@@ -797,13 +862,16 @@ if (-not $script:HasMutex) { exit }
 
 # ============ 启动 ============
 Ensure-DataDir
+Invoke-AbsenceBackfill                          # R19: 启动时补前一天（整天没开电脑漏记 0h 0min）
 $now = Get-Date
 if ((Test-Workday) -and $now.Hour -lt $script:WorkWindowStart) {
     # 8 点前：不轮询，睡到 8 点（过工作日守卫；周末不睡不弹）
     $eight = [datetime]::Today.AddHours($script:WorkWindowStart)
     Start-Sleep -Seconds ([int](($eight - $now).TotalSeconds) + 1)
 }
-# 8:00-12:00 启动：由主循环 2 分钟内兜底触发（R3）；12 点后启动当天不自动弹（R4）
+# R18: 启动触发（人到了开机才弹）：放宽到 8:00-23:00（12 点后启动当天也弹；主循环兜底仍 8-12 不覆盖）
+Invoke-WorkReminder -AllowLate $true
+# 8:00-12:00 启动：主循环仍每 2 分钟兜底（R3）
 
 # ============ 主循环（2 分钟轮询；try/catch 防脚本自杀 R5）============
 $prevLocked = Test-Locked
@@ -811,11 +879,12 @@ while ($true) {
     try {
         Start-Sleep -Seconds 120
         Invoke-OffWorkCheck
+        Invoke-AbsenceCheck              # R19: 工作日 20 点后无记录补 0h 0min（去重）
         Invoke-WorkReminder              # R3 每天 8 点兜底（不依赖启动/解锁事件；跨天常驻第二天 8 点也能弹）
         Cleanup-DialogRunspaces
         $locked = Test-Locked
         if ($prevLocked -and -not $locked) {
-            Invoke-WorkReminder          # 解锁触发（内部已过工作日+时间窗+去重守卫）
+            Invoke-WorkReminder -AllowLate $true   # R18: 解锁触发放宽到 8:00-23:00（人到了解锁才弹）
         }
         $prevLocked = $locked
     } catch {

@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  report.ps1  —  打卡时长统计报告（纯文本，不弹窗，v5）
+  report.ps1  —  打卡时长统计报告（纯文本，不弹窗，v6）
   用法（Windows PowerShell 5.1+）：
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1            # 本周（默认）
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Week
@@ -11,6 +11,7 @@
     - 数据来自 %USERPROFILE%\.clockin-reminder\history.csv
     - 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5）；offwork_actual 为空时回退 offwork_at（预计值）
     - v5: offwork 时间只存 HH:mm；跨天（end < start）视为次日（与主脚本 Get-RecordEnd 一致）
+    - v6: 请假/全天缺勤行（上班/下班都空）显示 0h 0min (请假)，计入工作日占位（不拉高不拉低）
     - 周 = 周一~周日；工作日合计（周一~周五）用于 50h 达标，周末加班单列
     - 解析失败的行跳过并在末尾提示行号
 #>
@@ -156,7 +157,11 @@ function Write-DayDetail {
         $start = Get-RecordStart $row
         $end = Get-RecordEnd -row $row -start $start
         $min = Get-RecordMinutes $row
-        if ($null -eq $start) {
+        # R20: 请假/全天缺勤行（上班/下班都空）→ 显示 0h 0min (请假)，而不是缺卡标记
+        if ([string]::IsNullOrWhiteSpace($row.clockin) -and [string]::IsNullOrWhiteSpace($row.offwork_at) -and [string]::IsNullOrWhiteSpace($row.offwork_actual)) {
+            $durDisp = if ([string]::IsNullOrWhiteSpace($row.duration)) { '0h 0min' } else { $row.duration }
+            $null = $lines.Add(("  {0} {1:MM-dd}  -  -  {2}  (请假)" -f (Get-WeekdayName $day), $day, $durDisp))
+        } elseif ($null -eq $start) {
             $null = $lines.Add(("  {0} {1:MM-dd}  缺上班卡" -f (Get-WeekdayName $day), $day))
         } elseif ($null -eq $end) {
             $null = $lines.Add(("  {0} {1:MM-dd}  {2:HH:mm} -> 缺下班卡" -f (Get-WeekdayName $day), $day, $start))
@@ -223,7 +228,11 @@ function Show-AllReport {
         $start = Get-RecordStart $row
         $end = Get-RecordEnd -row $row -start $start
         $min = Get-RecordMinutes $row
-        if ($null -eq $start) {
+        # R20: 请假/全天缺勤行 → 显示 0h 0min (请假)
+        if ([string]::IsNullOrWhiteSpace($row.clockin) -and [string]::IsNullOrWhiteSpace($row.offwork_at) -and [string]::IsNullOrWhiteSpace($row.offwork_actual)) {
+            $durDisp = if ([string]::IsNullOrWhiteSpace($row.duration)) { '0h 0min' } else { $row.duration }
+            Write-Output ("  {0:yyyy-MM-dd}（{1}）  -  -  {2}  (请假)" -f $rd, (Get-WeekdayName $rd), $durDisp)
+        } elseif ($null -eq $start) {
             Write-Output ("  {0:yyyy-MM-dd}（{1}）  缺上班卡" -f $rd, (Get-WeekdayName $rd))
         } elseif ($null -eq $end) {
             Write-Output ("  {0:yyyy-MM-dd}（{1}）  {2:HH:mm} -> 缺下班卡" -f $rd, (Get-WeekdayName $rd), $start)
