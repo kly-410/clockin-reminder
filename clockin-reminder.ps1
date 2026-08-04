@@ -1,14 +1,16 @@
 #Requires -Version 5.1
 <#
-  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v3)
+  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v4)
   功能：
     1. 工作日(周一~周五)才提醒；周六/周日不弹任何提醒、不写 history（R1）
     2. 8 点前不轮询（睡到 8:00）；8:00-12:00 之间由主循环兜底弹上班提醒（R3/R4）
     3. 上班/下班弹窗在独立 runspace 线程中运行，不阻塞主循环（R2）
     4. 打卡时间 + 10 小时后主循环弹下班提醒；跨天未确认的下班提醒在工作日补弹（R8）
     5. 下班确认把实际时间写入 history.csv；下班弹窗附带今日/本周工作时长统计（R10/R12）
+    6. 下班提醒循环触发：确认一次后按 ReRemindIntervalMinutes 再提醒，直到不再确认或超过 MaxRemindHour（R15/R17）
+    7. offwork_actual 同一天多次确认取最晚（R16）
   数据文件：%USERPROFILE%\.clockin-reminder\
-    state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified）
+    state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
     history.csv  历史记录（date,clockin_time,offwork_at,offwork_actual）
     log.txt      异常日志
   运行：
@@ -25,6 +27,8 @@ $script:WorkWindowStart   = 8             # 上班提醒最早时间（8 点）
 $script:WorkWindowEnd     = 10            # 打卡时间最晚（提示用；超范围弹 YesNo 确认，不再硬拒）
 $script:WorkAutoPopupEnd  = 12            # 上班自动提醒最晚时间（12 点后启动当天不自动弹）
 $script:SkipWeekend       = $true         # 周六/周日不提醒、不写历史
+$script:ReRemindIntervalMinutes = 60      # 下班确认后多久再次提醒（分钟）（R15）
+$script:MaxRemindHour           = 23      # 超过该小时不再自动提醒下班（防深夜骚扰；可手动记）（R15）
 $script:DataDir           = Join-Path $env:USERPROFILE '.clockin-reminder'
 $script:StateFile         = Join-Path $script:DataDir 'state.json'
 $script:HistoryFile       = Join-Path $script:DataDir 'history.csv'
@@ -270,7 +274,7 @@ function Get-StateTodayMinutes {
     } catch { return $null }
 }
 
-# R10: 下班确认后把实际确认时间写入 history.csv 对应行（写 offwork_actual 列）
+# R10/R16: 下班确认后把实际确认时间写入 history.csv 对应行（offwork_actual 列，取最晚）
 function Set-HistoryOffworkActual {
     param([string]$date, [string]$actual)
     try {
@@ -282,6 +286,18 @@ function Set-HistoryOffworkActual {
             if ($cols.Count -ge 1 -and $cols[0].Trim() -eq $date) {
                 $c1 = if ($cols.Count -ge 2) { $cols[1].Trim() } else { '' }
                 $c2 = if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' }
+                $c3 = if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' }
+                # R16: 同一天多次下班打卡只取最晚——已有更晚记录则跳过（写日志）
+                if (-not [string]::IsNullOrWhiteSpace($c3)) {
+                    $exDt = [datetime]::MinValue
+                    $newDt = [datetime]::MinValue
+                    $exOk = [datetime]::TryParseExact($c3, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$exDt)
+                    $newOk = [datetime]::TryParseExact($actual, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$newDt)
+                    if ($exOk -and $newOk -and $newDt -le $exDt) {
+                        Write-Log "Set-HistoryOffworkActual 跳过：$date 已有更晚下班记录 $c3，新时间 $actual 不覆盖"
+                        continue
+                    }
+                }
                 $lines[$i] = "$date,$c1,$c2,$actual"
                 $changed = $true
             }
@@ -293,6 +309,36 @@ function Set-HistoryOffworkActual {
         }
     } catch {
         Write-Log "Set-HistoryOffworkActual 失败: $($_.Exception.Message)"
+    }
+}
+
+# R15: 下班确认回写（弹窗线程调用）。
+# 校验 state 当前待提醒基准 == 发起弹窗时的基准，防旧弹窗串改新一天数据（ExpectedOffworkAt 防串改）。
+# 确认后：offwork_notified=$false 允许再次提醒；next_remind_at = 确认时间 + ReRemindIntervalMinutes。
+function Invoke-OffworkConfirm {
+    param(
+        [string]$ExpectedOffworkAt,
+        [datetime]$ConfirmedAt,
+        [int]$ReRemindIntervalMinutes = $script:ReRemindIntervalMinutes
+    )
+    try {
+        $state = Read-State
+        if (-not $state) { return $false }
+        # 当前待提醒基准：next_remind_at（有值用）否则回退 offwork_at
+        $stateBase = if (-not [string]::IsNullOrWhiteSpace([string]$state.next_remind_at)) { [string]$state.next_remind_at } else { [string]$state.offwork_at }
+        if ($stateBase -ne $ExpectedOffworkAt) {
+            Write-Log "Invoke-OffworkConfirm 跳过：state 基准 [$stateBase] != 发起时基准 [$ExpectedOffworkAt]（旧弹窗防串改）"
+            return $false
+        }
+        $state.offwork_notified = $false
+        $state.next_remind_at = $ConfirmedAt.AddMinutes($ReRemindIntervalMinutes).ToString('yyyy-MM-dd HH:mm:ss')
+        Write-State $state
+        # R10/R16: 实际确认时间写入历史（取最晚）
+        Set-HistoryOffworkActual -date $state.date -actual $ConfirmedAt.ToString('yyyy-MM-dd HH:mm:ss')
+        return $true
+    } catch {
+        Write-Log "弹窗确认回写失败: $($_.Exception.Message)"
+        return $false
     }
 }
 
@@ -492,6 +538,7 @@ function Start-DialogRunspace {
         $null = $ps.AddScript("function Read-State { $((Get-Command -Name 'Read-State').Definition) }")
         $null = $ps.AddScript("function Add-HistoryLine { $((Get-Command -Name 'Add-HistoryLine').Definition) }")
         $null = $ps.AddScript("function Set-HistoryOffworkActual { $((Get-Command -Name 'Set-HistoryOffworkActual').Definition) }")
+        $null = $ps.AddScript("function Invoke-OffworkConfirm { $((Get-Command -Name 'Invoke-OffworkConfirm').Definition) }")
         $null = $ps.AddScript("function Write-Log { $((Get-Command -Name 'Write-Log').Definition) }")
 
         $main = @'
@@ -505,6 +552,7 @@ $script:HistoryFile  = $ctx.HistoryFile
 $script:LogFile      = $ctx.LogFile
 $script:SkipWeekend  = $ctx.SkipWeekend
 $script:OffWorkHours = $ctx.OffWorkHours
+$script:ReRemindIntervalMinutes = $ctx.ReRemindIntervalMinutes
 
 $dialogParams = @{
     Title       = $ctx.Title
@@ -530,19 +578,14 @@ try {
         $state.clockin_time = $result
         $state.offwork_at = $offworkAt.ToString('yyyy-MM-dd HH:mm:ss')
         $state.offwork_notified = $false
+        $state.next_remind_at = $null   # R15: 新工作日清掉昨天的循环提醒链，重新从首次提醒开始
         $state.work_reminder_shown = $true
         Write-State $state
         Add-HistoryLine -date $today -clockin $result -offworkAt $state.offwork_at
     } else {
         if (-not (Test-Workday)) { return }
-        $state = Read-State
-        # 仅当仍是发起时的那次下班提醒才回写，避免旧弹窗覆盖新一天数据
-        if ($state -and $state.offwork_at -eq $ctx.ExpectedOffworkAt) {
-            $state.offwork_notified = $true
-            Write-State $state
-            # R10: 实际确认下班时间写入历史（统计准确性前提）
-            Set-HistoryOffworkActual -date $state.date -actual (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        }
+        # R15: 确认回写（校验基准防串改；offwork_notified=$false 允许再次提醒；next_remind_at = 确认时间 + 间隔）
+        Invoke-OffworkConfirm -ExpectedOffworkAt $ctx.ExpectedOffworkAt -ConfirmedAt (Get-Date) -ReRemindIntervalMinutes $ctx.ReRemindIntervalMinutes
     }
 } catch {
     Write-Log "弹窗确认回写失败: $($_.Exception.Message)"
@@ -559,6 +602,7 @@ try {
             WorkWindowStart = $script:WorkWindowStart
             WorkWindowEnd = $script:WorkWindowEnd
             OffWorkHours = $script:OffWorkHours
+            ReRemindIntervalMinutes = $script:ReRemindIntervalMinutes
             SkipWeekend = $script:SkipWeekend
             DataDir = $script:DataDir
             StateFile = $script:StateFile
@@ -611,23 +655,49 @@ function Invoke-WorkReminder {
         -InputDefault $now.ToString('HH:mm')
 }
 
-# ============ 下班检查（主循环调用；跨天补弹 R8；周末守卫 R1；异步弹窗 R2）============
+# ============ 下班检查（主循环调用；跨天补弹 R8；周末守卫 R1；异步弹窗 R2；加班循环 R15）============
 function Invoke-OffWorkCheck {
     if (-not (Test-Workday)) { return }                    # R1 周末守卫
     $state = Read-State
     if (-not $state -or $state.offwork_notified) { return }
+    $now = Get-Date
+    # R15: 待提醒基准 = next_remind_at（有值用，循环提醒），否则回退 offwork_at（首次提醒 / 旧 state 兼容）
+    $isRepeat = -not [string]::IsNullOrWhiteSpace([string]$state.next_remind_at)
+    $baseRaw = if ($isRepeat) { [string]$state.next_remind_at } else { [string]$state.offwork_at }
     $target = $null
-    try { $target = [datetime]::ParseExact($state.offwork_at, 'yyyy-MM-dd HH:mm:ss', $null) } catch { return }  # R5
-    if ((Get-Date) -lt $target) { return }
+    try { $target = [datetime]::ParseExact($baseRaw, 'yyyy-MM-dd HH:mm:ss', $null) } catch { return }  # R5
+    if ($now -lt $target) { return }
+    # R15: 循环提醒只限当天（防跨天残留 next_remind_at 深夜/次日骚扰）；首次提醒保留跨天补弹（R8）
+    if ($isRepeat -and $target.Date -ne $now.Date) { return }
+    # R15: 超过当天最晚提醒时间不再自动弹（防深夜骚扰）
+    if ($now.Hour -ge $script:MaxRemindHour) { return }
 
-    # 先置标记再弹（R2），防止重复弹
+    # 先置标记再弹（R2），防止重复弹；下次确认后再重置为 $false 允许循环（R15）
     $state.offwork_notified = $true
     Write-State $state
 
+    # R17: 首次「可以打下班卡了」；第 N 次（N>=2）显示已满 X 小时（加班 Y 小时）再确认
+    if ($isRepeat) {
+        $start = $null
+        $sd = [datetime]::MinValue
+        $st = [datetime]::MinValue
+        if ([datetime]::TryParseExact([string]$state.date, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$sd) -and
+            [datetime]::TryParseExact([string]$state.clockin_time, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$st)) {
+            $start = $sd.Date.Add($st.TimeOfDay)
+        }
+        if ($null -ne $start) {
+            $X = [math]::Floor(($target - $start).TotalHours)
+            $Y = $X - $script:OffWorkHours
+            $msg = "上班 $($state.clockin_time) 打卡，已满 $X 小时（加班 $Y 小时），再次确认下班打卡！"
+        } else {
+            $msg = "上班 $($state.clockin_time) 打卡，已满 $script:OffWorkHours 小时，再次确认下班打卡！"
+        }
+    } else {
+        $msg = "上班 $($state.clockin_time) 打卡，已满 $script:OffWorkHours 小时，可以打下班卡了！"
+    }
     # R12: 下班确认弹窗附带 今日时长 + 本周工作日累计 + 50h 达标状态（附加信息，不改变强制确认语义）
-    $msg = "上班 $($state.clockin_time) 打卡，已满 $script:OffWorkHours 小时，可以打下班卡了！"
     $todayMin = Get-StateTodayMinutes $state
-    $wk = Get-WeekStats (Get-Date)
+    $wk = Get-WeekStats $now
     $statParts = New-Object System.Collections.ArrayList
     if ($null -ne $todayMin) {
         $null = $statParts.Add("今日时长 $(Format-Duration $todayMin)")
@@ -641,7 +711,7 @@ function Invoke-OffWorkCheck {
     }
     $msg += "`n$statLine"
     Start-DialogRunspace -Kind 'offwork' -Title '下班打卡提醒' -Message $msg `
-        -ExpectedOffworkAt $state.offwork_at
+        -ExpectedOffworkAt $baseRaw
 }
 
 # ============ 单实例互斥（R6）============

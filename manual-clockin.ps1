@@ -1,11 +1,12 @@
 #Requires -Version 5.1
 <#
-  manual-clockin.ps1  —  手动打卡（周末/任意时间加班记录，v3）
+  manual-clockin.ps1  —  手动打卡（周末/任意时间加班记录，v4）
   用法：
     双击运行，或命令行：
       powershell -NoProfile -ExecutionPolicy Bypass -File manual-clockin.ps1
   功能：
     - 选「记上班卡」或「记下班卡」，填时间（HH:mm，默认当前时间），点按钮写入
+    - 记下班卡取最晚（R16）：当天已有下班记录时，新时间更晚才确认更新；更早则提示跳过
     - 当天该类型已有记录时弹 YesNo 确认覆盖；没有则新增一行
     - 数据写入同一个 history.csv（date,clockin_time,offwork_at,offwork_actual）
     - 周末/任意时间记录计入周/月统计的「周末加班」单列，不参与 50h 达标判断
@@ -194,9 +195,19 @@ function Show-ManualDialog {
                 }
             } else {
                 if (-not [string]::IsNullOrWhiteSpace($r.offwork_actual)) {
+                    # R16: 同一天多次下班打卡取最晚——新时间更晚才确认更新；更早则提示并跳过
+                    $exDt = [datetime]::MinValue
+                    $exOk = [datetime]::TryParseExact($r.offwork_actual, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$exDt)
+                    $newDt = [datetime]::Today.Add($t.TimeOfDay)
+                    if ($exOk -and $newDt -le $exDt) {
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "已存在更晚的下班记录 $($r.offwork_actual)，不更新",
+                            '提示', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+                        return
+                    }
                     $ask = [System.Windows.Forms.MessageBox]::Show(
-                        "当天已有下班卡：$($r.offwork_actual)，覆盖？",
-                        '确认覆盖', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+                        "已存在下班记录 $($r.offwork_actual)，新时间 $hhmm 更晚，更新为 $hhmm？",
+                        '确认更新', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
                     if ($ask -ne [System.Windows.Forms.DialogResult]::Yes) { return }
                 }
             }
