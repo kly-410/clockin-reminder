@@ -271,6 +271,82 @@ function Show-DaysReport {
     Write-Output ("  总计         {0}" -f (Format-Duration ($weekdayMin + $weekendMin)))
 }
 
+# ============ 每周 CSV 导出（log 文件夹，每周期一个文件）============
+# 生成 %USERPROFILE%\.clockin-reminder\log\week-<年-W周>.csv
+# 内容：本周每天的明细（CSV 行）+ 周统计 + 本月累计统计（满足"包含该月已有数据"）
+function Export-WeeklyCsv {
+    param([datetime]$d = (Get-Date))
+    try {
+        $logDir = Join-Path $script:DataDir 'log'
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+
+        $range = Get-WeekRange $d
+        $weekNum = [System.Globalization.CultureInfo]::InvariantCulture.Calendar.GetWeekOfYear(
+            $d, [System.Globalization.CalendarWeekRule]::FirstFourDayWeek, [DayOfWeek]::Monday)
+        $file = Join-Path $logDir ("week-{0}-W{1:D2}.csv" -f $d.Year, $weekNum)
+
+        $rows = @(Read-HistoryRows)
+        $lines = New-Object System.Collections.ArrayList
+        $null = $lines.Add('日期,星期,上班时间,预计下班,实际下班,工作时长')
+        $weekdayMin = 0.0; $weekendMin = 0.0
+        $weekStart = $range.Monday; $weekEnd = $range.Sunday
+        for ($day = $weekStart; $day -le $weekEnd; $day = $day.AddDays(1)) {
+            $dayStr = $day.ToString('yyyy-MM-dd')
+            $row = $rows | Where-Object { $_.date -eq $dayStr } | Select-Object -First 1
+            if ($null -eq $row) {
+                $null = $lines.Add(("{0},{1},,,," -f $dayStr, (Get-WeekdayName $day)))
+                continue
+            }
+            $start = Get-RecordStart $row
+            $end = Get-RecordEnd $row $start
+            $min = Get-RecordMinutes $row
+            $startStr = if ($null -ne $start) { $start.ToString('HH:mm') } else { '' }
+            $endStr = if ($null -ne $end) { $end.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+            $durStr = if ($null -ne $min) { Format-Duration $min } else { '' }
+            $null = $lines.Add(("{0},{1},{2},{3},{4},{5}" -f $dayStr, (Get-WeekdayName $day), $startStr, $row.offwork_at, $endStr, $durStr))
+            if ($null -ne $min) {
+                if (Test-Weekend $day) { $weekendMin += $min } else { $weekdayMin += $min }
+            }
+        }
+
+        # 周统计
+        $null = $lines.Add('')
+        $null = $lines.Add(('本周统计,{0} ~ {1}' -f $weekStart.ToString('yyyy-MM-dd'), $weekEnd.ToString('yyyy-MM-dd')))
+        $null = $lines.Add(('工作日合计,,{0}' -f (Format-Duration $weekdayMin)))
+        $null = $lines.Add(('周末加班,,{0}' -f (Format-Duration $weekendMin)))
+        $null = $lines.Add(('本周总计,,{0}' -f (Format-Duration ($weekdayMin + $weekendMin))))
+        if ($weekdayMin -ge 3000) {
+            $null = $lines.Add('50h达标,,✅ 达标 (≥50h)')
+        } else {
+            $null = $lines.Add(('50h达标,,⚠️ 还差 {0} 达 50h' -f (Format-Duration (3000 - $weekdayMin))))
+        }
+
+        # 本月累计（满足"包含该月已有数据"）— 内联计算（report 无 Get-MonthStats）
+        $first = [datetime]::new($d.Year, $d.Month, 1)
+        $last = $first.AddMonths(1).AddDays(-1)
+        $mWeekday = 0.0; $mWeekend = 0.0
+        foreach ($row in $rows) {
+            $rd = ConvertTo-StatsDate $row.date
+            if ($null -eq $rd) { continue }
+            if ($rd -lt $first -or $rd -gt $last) { continue }
+            $min = Get-RecordMinutes $row
+            if ($null -eq $min) { continue }
+            if (Test-Weekend $rd) { $mWeekend += $min } else { $mWeekday += $min }
+        }
+        $null = $lines.Add('')
+        $null = $lines.Add(('本月累计,{0:yyyy-MM}' -f $d))
+        $null = $lines.Add(('本月工作日,,{0}' -f (Format-Duration $mWeekday)))
+        $null = $lines.Add(('本月加班,,{0}' -f (Format-Duration $mWeekend)))
+        $null = $lines.Add(('本月合计,,{0}' -f (Format-Duration ($mWeekday + $mWeekend))))
+
+        $lines | Set-Content -Path $file -Encoding UTF8
+        return $file
+    } catch {
+        Write-Warning "生成每周 CSV 失败: $($_.Exception.Message)"
+        return $null
+    }
+}
+
 # ============ 入口 ============
 $report = New-Object System.Collections.ArrayList
 if (-not (Test-Path $script:HistoryFile)) {
@@ -312,7 +388,7 @@ if ($Gui) {
     $report | ForEach-Object { Write-Output $_ }
 }
 
-# -Save：把统计报告内容同时写入 report-<日期>.csv（bat 调用时默认保存）
+# -Save：把统计报告内容同时写入 report-<日期>.csv + 生成每周 log CSV（bat 调用时默认保存）
 if ($Save) {
     $savePath = Join-Path $script:DataDir ("report-{0:yyyyMMdd}.csv" -f (Get-Date))
     try {
@@ -320,4 +396,7 @@ if ($Save) {
     } catch {
         Write-Warning "保存统计到 $savePath 失败: $($_.Exception.Message)"
     }
+    # 生成 log/week-<年-W周>.csv（本周明细 + 周统计 + 本月累计）
+    $weekFile = Export-WeeklyCsv
+    if ($weekFile) { Write-Host "已生成每周统计: $weekFile" }
 }
