@@ -418,14 +418,14 @@ function Show-MandatoryDialog {
     $form.BackColor = [System.Drawing.Color]::FromArgb(255, 255, 0)       # 刺眼黄
     $form.TopMost = $true
     $form.KeyPreview = $true
-    $form.Tag = @{ Value = $null; Input = $null; WithInput = $WithInput; WorkStart = $WorkStart; WorkEnd = $WorkEnd }
+    $form.Tag = @{ Value = $null; Input = $null; Skipped = $false; WithInput = $WithInput; WorkStart = $WorkStart; WorkEnd = $WorkEnd }
 
     # 拦截 Esc
     $form.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $_.SuppressKeyPress = $true } })
-    # 拦截 Alt+F4 / 一切关闭：未确认前禁止关窗
+    # 拦截 Alt+F4 / 一切关闭：未确认且未点后门按钮前禁止关窗
     $form.Add_FormClosing({
         param($sender, $e)
-        if ($null -eq $sender.Tag.Value) { $e.Cancel = $true }
+        if ($null -eq $sender.Tag.Value -and -not $sender.Tag.Skipped) { $e.Cancel = $true }
     })
 
     $label = New-Object System.Windows.Forms.Label
@@ -505,7 +505,26 @@ function Show-MandatoryDialog {
     $form.Controls.Add($btn)
     $form.AcceptButton = $btn   # Enter 键提交（R9）
 
+    # 后门按钮：紧急逃生（防调试时强制弹窗卡死电脑）。低调放右下角，点它关闭弹窗且不写任何打卡数据。
+    # 主循环弹窗前已置防重复标记（work_reminder_shown / offwork_notified），关闭后当天不会再弹，不会死循环。
+    $escape = New-Object System.Windows.Forms.Button
+    $escape.Text = '紧急关闭（不打卡）'
+    $escape.Font = New-Object System.Drawing.Font('Microsoft YaHei', 12, [System.Drawing.FontStyle]::Regular)
+    $escape.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 0)
+    $escape.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 0)
+    $escape.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $escape.FlatAppearance.BorderSize = 0
+    $escape.SetBounds(($w - 180), ($h - 60), 170, 50)
+    $escape.Add_Click({
+        param($sender, $e)
+        $f = $sender.FindForm()
+        $f.Tag.Skipped = $true
+        $f.Close()
+    })
+    $form.Controls.Add($escape)
+
     $null = $form.ShowDialog()
+    if ($form.Tag.Skipped) { return $null }   # 逃生：调用方当"未确认"处理
     return $form.Tag.Value
 }
 
