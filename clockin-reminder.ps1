@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v6)
+  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v7)
   功能：
     1. 工作日(周一~周五)才提醒；周六/周日不弹任何提醒、不写 history（R1）
     2. 8 点前不轮询（睡到 8:00）；主循环兜底 8:00-12:00 弹上班提醒；解锁/启动触发放宽到 8:00-23:00（R3/R4/R18）
@@ -10,6 +10,7 @@
     6. 下班提醒循环触发：确认一次后按 ReRemindIntervalMinutes 再提醒，直到不再确认或超过 MaxRemindHour（R15/R17）
     7. offwork_actual 同一天多次确认取最晚（R16）
     8. 全天缺勤补记：工作日 20 点后无记录补 0h 0min；启动时补前一天 0h 0min（R19）
+    9. 配置持久化到 config.json；弹窗底部配置区先解锁才能改，保存后下次轮询生效（R21/R23）
   数据文件：%USERPROFILE%\.clockin-reminder\
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
     history.csv  历史记录（日期,上班时间,预计下班,实际下班,工作时长；v5 起 offwork 时间只存 HH:mm）
@@ -22,27 +23,135 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ============ 配置 ============
-$script:OffWorkHours      = 10            # 上班打卡后多少小时提醒下班
-$script:WorkWindowStart   = 8             # 上班提醒最早时间（8 点）
-$script:WorkWindowEnd     = 10            # 打卡时间最晚（提示用；超范围弹 YesNo 确认，不再硬拒；R18 起上限放宽到 max(10, 当前时刻)）
-$script:WorkAutoPopupEnd  = 12            # 上班自动提醒最晚时间（12 点后启动当天不自动弹）
-$script:SkipWeekend       = $true         # 周六/周日不提醒、不写历史
-$script:ReRemindIntervalMinutes = 30      # 满 10h 后默认每 30 分钟再弹一次（R15）
-$script:MaxRemindHour           = 23      # 超过该小时不再自动提醒下班（防深夜骚扰；可手动记）（R15）
-$script:DataDir           = Join-Path $env:USERPROFILE '.clockin-reminder'
-$script:StateFile         = Join-Path $script:DataDir 'state.json'
-$script:HistoryFile       = Join-Path $script:DataDir 'history.csv'
-$script:LogFile           = Join-Path $script:DataDir 'log.txt'
+# ============ 配置（R21：config.json 持久化；硬编码默认值保留作 fallback）============
+$script:DefaultConfig = @{
+    OffWorkHours             = 10            # 上班打卡后多少小时提醒下班
+    WorkWindowStart          = 8             # 上班提醒最早时间（8 点）
+    WorkWindowEnd            = 10            # 打卡时间最晚（提示用；超范围弹 YesNo 确认，不再硬拒；R18 起上限放宽到 max(10, 当前时刻)）
+    WorkAutoPopupEnd         = 12            # 上班自动提醒最晚时间（12 点后启动当天不自动弹）
+    SkipWeekend              = $true         # 周六/周日不提醒、不写历史
+    ReRemindIntervalMinutes  = 30            # 满 10h 后默认每 30 分钟再弹一次（R15）
+    MaxRemindHour            = 23            # 超过该小时不再自动提醒下班（防深夜骚扰；可手动记）（R15）
+}
+$script:DataDir     = Join-Path $env:USERPROFILE '.clockin-reminder'
+$script:ConfigFile  = Join-Path $script:DataDir 'config.json'
+$script:StateFile   = Join-Path $script:DataDir 'state.json'
+$script:HistoryFile = Join-Path $script:DataDir 'history.csv'
+$script:LogFile     = Join-Path $script:DataDir 'log.txt'
+
+# R21: 读 config.json → 合并后的 hashtable；缺失字段用默认值；文件不存在返回默认值
+function Read-Config {
+    return Invoke-DataLocked {
+        $cfg = @{}
+        foreach ($k in $script:DefaultConfig.Keys) { $cfg[$k] = $script:DefaultConfig[$k] }
+        if (Test-Path $script:ConfigFile) {
+            try {
+                $obj = Get-Content -Path $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($null -ne $obj) {
+                    foreach ($p in $obj.PSObject.Properties) {
+                        if ($cfg.ContainsKey($p.Name)) { $cfg[$p.Name] = $p.Value }
+                    }
+                }
+            } catch {
+                Write-Log "Read-Config 失败，用默认值: $($_.Exception.Message)"
+            }
+        }
+        return $cfg
+    }
+}
+
+# R21: 写 config.json（原子写，防写一半损坏）
+function Write-Config {
+    param($cfg)
+    Invoke-DataLocked {
+        try {
+            if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
+            $tmp = "$($script:ConfigFile).tmp"
+            $cfg | ConvertTo-Json | Set-Content -Path $tmp -Encoding UTF8
+            Move-Item -Path $tmp -Destination $script:ConfigFile -Force
+        } catch {
+            Write-Log "Write-Config 失败: $($_.Exception.Message)"
+        }
+    }
+}
+
+# R23: 弹窗底部配置摘要（只读小字显示当前配置）
+function Get-ConfigSummary {
+    param($cfg)
+    $parts = New-Object System.Collections.ArrayList
+    $null = $parts.Add("满$($cfg.OffWorkHours)h提醒下班")
+    $null = $parts.Add("上班窗$($cfg.WorkWindowStart)-$($cfg.WorkAutoPopupEnd)点")
+    $null = $parts.Add("打卡最晚$($cfg.WorkWindowEnd)点")
+    $null = $parts.Add("循环$($cfg.ReRemindIntervalMinutes)min")
+    $null = $parts.Add("$($cfg.MaxRemindHour)点截止")
+    if ($cfg.SkipWeekend) { $null = $parts.Add('周末跳过✓') } else { $null = $parts.Add('周末提醒') }
+    return ($parts -join ' · ')
+}
+
+# R23: 重载 config.json 到脚本配置变量（每次轮询/弹窗前调用 → 配置变更下次轮询生效）
+# P1-4: 逐项校验类型/范围，非法值一律回退默认，避免 config.json 手改坏后脚本行为异常
+function Get-ValidatedInt {
+    param($Value, [int]$Default, [int]$Min, [int]$Max)
+    try {
+        $n = [int]$Value
+        if ($n -ge $Min -and $n -le $Max) { return $n }
+    } catch { }
+    return $Default
+}
+
+function Get-ValidatedBool {
+    param($Value, [bool]$Default)
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [string]) {
+        if ($Value -match '^(true|1|是|yes)$') { return $true }
+        if ($Value -match '^(false|0|否|no)$') { return $false }
+        return $Default
+    }
+    try { return [bool]$Value } catch { return $Default }
+}
+
+function Reload-Config {
+    try {
+        $cfg = Read-Config
+        $d = $script:DefaultConfig
+        $script:OffWorkHours             = Get-ValidatedInt $cfg.OffWorkHours             $d.OffWorkHours             1   23
+        $script:WorkWindowStart          = Get-ValidatedInt $cfg.WorkWindowStart          $d.WorkWindowStart          0   12
+        $script:WorkWindowEnd            = Get-ValidatedInt $cfg.WorkWindowEnd            $d.WorkWindowEnd            1   23
+        $script:WorkAutoPopupEnd         = Get-ValidatedInt $cfg.WorkAutoPopupEnd         $d.WorkAutoPopupEnd         1   23
+        $script:ReRemindIntervalMinutes  = Get-ValidatedInt $cfg.ReRemindIntervalMinutes  $d.ReRemindIntervalMinutes  1   480
+        $script:MaxRemindHour            = Get-ValidatedInt $cfg.MaxRemindHour            $d.MaxRemindHour            0   23
+        $script:SkipWeekend              = Get-ValidatedBool $cfg.SkipWeekend $d.SkipWeekend
+    } catch {
+        Write-Log "Reload-Config 失败，回退默认: $($_.Exception.Message)"
+        foreach ($k in $script:DefaultConfig.Keys) { Set-Variable -Name $k -Value $script:DefaultConfig[$k] -Scope Script }
+    }
+}
+# 当前生效配置变量（启动时由 Reload-Config 从 config.json 覆盖）
+$script:OffWorkHours             = $script:DefaultConfig.OffWorkHours
+$script:WorkWindowStart          = $script:DefaultConfig.WorkWindowStart
+$script:WorkWindowEnd            = $script:DefaultConfig.WorkWindowEnd
+$script:WorkAutoPopupEnd         = $script:DefaultConfig.WorkAutoPopupEnd
+$script:SkipWeekend              = $script:DefaultConfig.SkipWeekend
+$script:ReRemindIntervalMinutes  = $script:DefaultConfig.ReRemindIntervalMinutes
+$script:MaxRemindHour            = $script:DefaultConfig.MaxRemindHour
 
 # 进行中的弹窗 runspace 引用，防止被垃圾回收杀掉弹窗线程
 $script:PendingPopups = [System.Collections.ArrayList]::new()
 $script:SkippedLines  = New-Object System.Collections.ArrayList   # 历史解析失败行号（容错用）
 
 # ============ 日志 ============
+# P2-1: 日志轮转——log.txt 超过 1MB 时改名 log.txt.old 保留一份，重新开始写（防日志无限膨胀）
 function Write-Log {
     param([string]$Message)
     try {
+        if (Test-Path $script:LogFile) {
+            $f = Get-Item -Path $script:LogFile -ErrorAction SilentlyContinue
+            if ($null -ne $f -and $f.Length -gt 1MB) {
+                $backup = "$($script:LogFile).old"
+                Remove-Item -Path $backup -Force -ErrorAction SilentlyContinue
+                Move-Item -Path $script:LogFile -Destination $backup -Force -ErrorAction SilentlyContinue
+            }
+        }
         Add-Content -Path $script:LogFile -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message" -Encoding UTF8 -ErrorAction Stop
     } catch { }
 }
@@ -51,28 +160,53 @@ function Write-Log {
 function Ensure-DataDir {
     if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
     if (-not (Test-Path $script:HistoryFile)) { Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8 }
+    # P2-2: 清理原子写残留 .tmp（上次进程崩溃/被杀可能留下写一半的临时文件；正式文件 Move-Item 是原子的不受影响）
+    foreach ($f in @($script:StateFile, $script:HistoryFile, $script:ConfigFile)) {
+        $tmp = "$f.tmp"
+        if (Test-Path $tmp) { Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# P1-3: 数据文件互斥锁。主循环线程与弹窗 runspace 线程并发读写 history/state/config 会互相踩
+# （读改写竞态：一个线程基于旧文件改写后覆盖另一个线程的更新），统一走命名 Mutex 串行化。
+# 命名 Mutex 同进程多线程/跨进程可共享；$script:DataMutex 在启动时创建，runspace 里由 ctx 传入。
+function Invoke-DataLocked {
+    param([scriptblock]$Action)
+    if ($null -eq $script:DataMutex) { return & $Action }   # 创建失败退化为不加锁（原子写仍防写一半）
+    $acquired = $false
+    try {
+        $acquired = $script:DataMutex.WaitOne(10000)
+        if (-not $acquired) { throw '数据锁等待超时' }
+        return & $Action
+    } finally {
+        if ($acquired) { $script:DataMutex.ReleaseMutex() }
+    }
 }
 
 # 读取 state.json；统一转成 hashtable，避免 PSCustomObject 加属性报错（R5）
 function Read-State {
-    if (-not (Test-Path $script:StateFile)) { return $null }
-    try {
-        $obj = Get-Content -Path $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $obj) { return $null }
-        $h = @{}
-        foreach ($p in $obj.PSObject.Properties) { $h[$p.Name] = $p.Value }
-        return $h
-    } catch { return $null }
+    return Invoke-DataLocked {
+        if (-not (Test-Path $script:StateFile)) { return $null }
+        try {
+            $obj = Get-Content -Path $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -eq $obj) { return $null }
+            $h = @{}
+            foreach ($p in $obj.PSObject.Properties) { $h[$p.Name] = $p.Value }
+            return $h
+        } catch { return $null }
+    }
 }
 
 # 原子写：临时文件 + Move-Item，避免写一半崩掉损坏 state.json（R5）
 function Write-State($state) {
-    try {
-        $tmp = "$($script:StateFile).tmp"
-        $state | ConvertTo-Json | Set-Content -Path $tmp -Encoding UTF8
-        Move-Item -Path $tmp -Destination $script:StateFile -Force
-    } catch {
-        Write-Log "Write-State 失败: $($_.Exception.Message)"
+    Invoke-DataLocked {
+        try {
+            $tmp = "$($script:StateFile).tmp"
+            $state | ConvertTo-Json | Set-Content -Path $tmp -Encoding UTF8
+            Move-Item -Path $tmp -Destination $script:StateFile -Force
+        } catch {
+            Write-Log "Write-State 失败: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -80,19 +214,21 @@ function Write-State($state) {
 # v5: 5 列，offwork_at 只存 HH:mm（去掉日期）；写上班卡时同时算 duration（缺实际下班回退预计 offwork_at）
 function Add-HistoryLine {
     param([string]$date, [string]$clockin, [string]$offworkAt)
-    try {
-        if (-not (Test-Path $script:HistoryFile)) {
-            Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
+    Invoke-DataLocked {
+        try {
+            if (-not (Test-Path $script:HistoryFile)) {
+                Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
+            }
+            if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }
+            $offTime = ConvertTo-HHmm $offworkAt
+            $durStr = ''
+            $row = [pscustomobject]@{ date = $date; clockin = $clockin; offwork_at = $offTime; offwork_actual = '' }
+            $min = Get-RecordMinutes $row
+            if ($null -ne $min) { $durStr = Format-RowDuration $min }
+            Add-Content -Path $script:HistoryFile -Value "$date,$clockin,$offTime,,$durStr" -Encoding UTF8
+        } catch {
+            Write-Log "Add-HistoryLine 失败: $($_.Exception.Message)"
         }
-        if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }
-        $offTime = ConvertTo-HHmm $offworkAt
-        $durStr = ''
-        $row = [pscustomobject]@{ date = $date; clockin = $clockin; offwork_at = $offTime; offwork_actual = '' }
-        $min = Get-RecordMinutes $row
-        if ($null -ne $min) { $durStr = Format-Duration $min }
-        Add-Content -Path $script:HistoryFile -Value "$date,$clockin,$offTime,,$durStr" -Encoding UTF8
-    } catch {
-        Write-Log "Add-HistoryLine 失败: $($_.Exception.Message)"
     }
 }
 
@@ -204,6 +340,15 @@ function Format-Duration {
     return ('{0}h {1}min' -f $h, $m)
 }
 
+# P2-3: 单条记录时长显示；超过 18h 视为可疑（跨天推断/手滑填错），末尾加 ? 标记。
+# 仅用于 history.csv 的 duration 列；周/月合计仍走 Format-Duration（合计超 18h 正常，不标记）。
+function Format-RowDuration {
+    param([double]$Minutes)
+    $s = Format-Duration $Minutes
+    if ($Minutes -gt (18 * 60)) { $s += '?' }
+    return $s
+}
+
 function Test-Weekend {
     param([datetime]$d)
     $dow = $d.DayOfWeek
@@ -309,47 +454,49 @@ function Get-StateTodayMinutes {
 # v5: offwork_actual 只存 HH:mm；确认后重算该行 duration 列（取最晚后时长可能变）
 function Set-HistoryOffworkActual {
     param([string]$date, [string]$actual)
-    try {
-        if (-not (Test-Path $script:HistoryFile)) { return }
-        $lines = @(Get-Content -Path $script:HistoryFile -Encoding UTF8)
-        $changed = $false
-        for ($i = 1; $i -lt $lines.Count; $i++) {
-            $cols = $lines[$i].Split(',')
-            if ($cols.Count -ge 1 -and $cols[0].Trim() -eq $date) {
-                $c1 = if ($cols.Count -ge 2) { $cols[1].Trim() } else { '' }
-                $c2 = if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' }
-                $c3 = if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' }
-                # R16: 同一天多次下班打卡只取最晚——已有更晚记录则跳过（写日志）
-                # v5: 用跨天推断把已有 HH:mm 还原成完整 end 再比较（00:30 次日 > 23:50 当天）
-                if (-not [string]::IsNullOrWhiteSpace($c3)) {
-                    $exRow = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $c3 }
-                    $exStart = Get-RecordStart $exRow
-                    $exEnd = Get-RecordEnd -row $exRow -start $exStart
-                    $newDt = [datetime]::MinValue
-                    if ($null -ne $exEnd -and
-                        [datetime]::TryParseExact($actual, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$newDt) -and
-                        $newDt -le $exEnd) {
-                        Write-Log "Set-HistoryOffworkActual 跳过：$date 已有更晚下班记录 $c3，新时间 $actual 不覆盖"
-                        continue
+    Invoke-DataLocked {
+        try {
+            if (-not (Test-Path $script:HistoryFile)) { return }
+            $lines = @(Get-Content -Path $script:HistoryFile -Encoding UTF8)
+            $changed = $false
+            for ($i = 1; $i -lt $lines.Count; $i++) {
+                $cols = $lines[$i].Split(',')
+                if ($cols.Count -ge 1 -and $cols[0].Trim() -eq $date) {
+                    $c1 = if ($cols.Count -ge 2) { $cols[1].Trim() } else { '' }
+                    $c2 = if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' }
+                    $c3 = if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' }
+                    # R16: 同一天多次下班打卡只取最晚——已有更晚记录则跳过（写日志）
+                    # v5: 用跨天推断把已有 HH:mm 还原成完整 end 再比较（00:30 次日 > 23:50 当天）
+                    if (-not [string]::IsNullOrWhiteSpace($c3)) {
+                        $exRow = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $c3 }
+                        $exStart = Get-RecordStart $exRow
+                        $exEnd = Get-RecordEnd -row $exRow -start $exStart
+                        $newDt = [datetime]::MinValue
+                        if ($null -ne $exEnd -and
+                            [datetime]::TryParseExact($actual, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$newDt) -and
+                            $newDt -le $exEnd) {
+                            Write-Log "Set-HistoryOffworkActual 跳过：$date 已有更晚下班记录 $c3，新时间 $actual 不覆盖"
+                            continue
+                        }
                     }
+                    # v5: 只存 HH:mm；用 Get-RecordMinutes 重算 duration（优先 actual，空则回退 at）
+                    $actualHHmm = ConvertTo-HHmm $actual
+                    $durStr = ''
+                    $row = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $actualHHmm }
+                    $min = Get-RecordMinutes $row
+                    if ($null -ne $min) { $durStr = Format-RowDuration $min }
+                    $lines[$i] = "$date,$c1,$c2,$actualHHmm,$durStr"
+                    $changed = $true
                 }
-                # v5: 只存 HH:mm；用 Get-RecordMinutes 重算 duration（优先 actual，空则回退 at）
-                $actualHHmm = ConvertTo-HHmm $actual
-                $durStr = ''
-                $row = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $actualHHmm }
-                $min = Get-RecordMinutes $row
-                if ($null -ne $min) { $durStr = Format-Duration $min }
-                $lines[$i] = "$date,$c1,$c2,$actualHHmm,$durStr"
-                $changed = $true
             }
+            if ($changed) {
+                $tmp = "$($script:HistoryFile).tmp"
+                $lines | Set-Content -Path $tmp -Encoding UTF8
+                Move-Item -Path $tmp -Destination $script:HistoryFile -Force
+            }
+        } catch {
+            Write-Log "Set-HistoryOffworkActual 失败: $($_.Exception.Message)"
         }
-        if ($changed) {
-            $tmp = "$($script:HistoryFile).tmp"
-            $lines | Set-Content -Path $tmp -Encoding UTF8
-            Move-Item -Path $tmp -Destination $script:HistoryFile -Force
-        }
-    } catch {
-        Write-Log "Set-HistoryOffworkActual 失败: $($_.Exception.Message)"
     }
 }
 
@@ -388,6 +535,17 @@ function Invoke-OffworkConfirm {
 function Test-Workday {
     if (-not $script:SkipWeekend) { return $true }
     $dow = (Get-Date).DayOfWeek
+    return ($dow -ne [DayOfWeek]::Saturday) -and ($dow -ne [DayOfWeek]::Sunday)
+}
+
+# P1-2: 判断指定日期是否工作日（按 SkipWeekend 配置）。弹窗跨天确认时用发起日判断，
+# 避免「周五 23:59 弹窗、周六 00:01 确认」因当前时刻已跨天/跨周末而把确认吞掉。
+function Test-WorkdayAt {
+    param([string]$dateStr)
+    if (-not $script:SkipWeekend) { return $true }
+    $d = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($dateStr, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { $d = Get-Date }
+    $dow = $d.DayOfWeek
     return ($dow -ne [DayOfWeek]::Saturday) -and ($dow -ne [DayOfWeek]::Sunday)
 }
 
@@ -562,7 +720,7 @@ function Show-MandatoryDialog {
                     '确认', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
                 if ($ask -ne [System.Windows.Forms.DialogResult]::Yes) { return }
             }
-            $tag.Value = $val.ToString('HH:mm')
+            $tag.Value = $t.ToString('HH:mm')
         } else {
             $tag.Value = $true
         }
@@ -589,6 +747,146 @@ function Show-MandatoryDialog {
     })
     $form.Controls.Add($escape)
 
+    # ---- R23: 底部配置区（默认只读摘要；先点「解锁更改配置」才能改，防误触；保存写 config.json）----
+    # 锁定条：整宽条（在主确认按钮下方，不与按钮重叠）
+    $cfgStrip = New-Object System.Windows.Forms.Panel
+    $cfgStrip.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 0)
+    $cfgStrip.SetBounds(15, ($h - 62), ($w - 205), 52)
+    $form.Controls.Add($cfgStrip)
+
+    $cfgSummary = New-Object System.Windows.Forms.Label
+    $cfgSummary.Text = '配置 · ' + (Get-ConfigSummary (Read-Config))
+    $cfgSummary.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10, [System.Drawing.FontStyle]::Regular)
+    $cfgSummary.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 0)
+    $cfgSummary.BackColor = $cfgStrip.BackColor
+    $cfgSummary.SetBounds(8, 4, ($cfgStrip.Width - 140), 44)
+    $cfgSummary.TextAlign = 'MiddleLeft'
+    $cfgStrip.Controls.Add($cfgSummary)
+
+    $btnUnlock = New-Object System.Windows.Forms.Button
+    $btnUnlock.Text = '解锁更改配置'
+    $btnUnlock.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9, [System.Drawing.FontStyle]::Regular)
+    $btnUnlock.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 0)
+    $btnUnlock.BackColor = [System.Drawing.Color]::White
+    $btnUnlock.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnUnlock.FlatAppearance.BorderSize = 0
+    $btnUnlock.SetBounds(($cfgStrip.Width - 118), 8, 108, 36)
+    $cfgStrip.Controls.Add($btnUnlock)
+
+    # 编辑控件（默认隐藏，解锁后显示；放左下角窄区，避开中央确认按钮）
+    $cfgNarrow = [Math]::Max(220, [Math]::Min(360, ($cx - 325)))
+    $editTop = ($h - 62 - 252)
+    $cfgRows = @(
+        @{ Name = 'OffWorkHours';            Label = '下班提醒(小时)';  Min = 1;  Max = 23 },
+        @{ Name = 'WorkWindowStart';         Label = '上班最早(点)';    Min = 0;  Max = 12 },
+        @{ Name = 'WorkWindowEnd';           Label = '打卡最晚(点)';    Min = 1;  Max = 23 },
+        @{ Name = 'WorkAutoPopupEnd';        Label = '自动弹最晚(点)';  Min = 1;  Max = 23 },
+        @{ Name = 'ReRemindIntervalMinutes'; Label = '循环间隔(分)';    Min = 1;  Max = 480 },
+        @{ Name = 'MaxRemindHour';           Label = '最晚提醒(点)';    Min = 0;  Max = 23 }
+    )
+    $curCfg = Read-Config
+    $cfgNuds = @{}
+    $rowY = $editTop + 6
+    foreach ($r in $cfgRows) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $r.Label
+        $lbl.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9, [System.Drawing.FontStyle]::Regular)
+        $lbl.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 0)
+        $lbl.BackColor = $form.BackColor
+        $lbl.SetBounds(23, ($rowY + 4), 118, 22)
+        $lbl.Visible = $false
+        $form.Controls.Add($lbl)
+
+        $nud = New-Object System.Windows.Forms.NumericUpDown
+        $nud.Minimum = $r.Min
+        $nud.Maximum = $r.Max
+        $nud.Value = [Math]::Max($r.Min, [Math]::Min($r.Max, [int]$curCfg[$r.Name]))
+        $nud.SetBounds(147, $rowY, 70, 28)
+        $nud.Visible = $false
+        $form.Controls.Add($nud)
+        $cfgNuds[$r.Name] = $nud
+        $rowY += 34
+    }
+    $cfgChk = New-Object System.Windows.Forms.CheckBox
+    $cfgChk.Text = '周末跳过'
+    $cfgChk.Checked = [bool]$curCfg.SkipWeekend
+    $cfgChk.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9, [System.Drawing.FontStyle]::Regular)
+    $cfgChk.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 0)
+    $cfgChk.SetBounds(23, ($editTop + 214), 100, 28)
+    $cfgChk.Visible = $false
+    $form.Controls.Add($cfgChk)
+
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text = '保存配置'
+    $btnSave.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9, [System.Drawing.FontStyle]::Regular)
+    $btnSave.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 0)
+    $btnSave.BackColor = [System.Drawing.Color]::White
+    $btnSave.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnSave.SetBounds((15 + $cfgNarrow - 206), ($editTop + 208), 92, 36)
+    $btnSave.Visible = $false
+    $form.Controls.Add($btnSave)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = '取消'
+    $btnCancel.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9, [System.Drawing.FontStyle]::Regular)
+    $btnCancel.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 0)
+    $btnCancel.BackColor = [System.Drawing.Color]::White
+    $btnCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnCancel.SetBounds((15 + $cfgNarrow - 106), ($editTop + 208), 92, 36)
+    $btnCancel.Visible = $false
+    $form.Controls.Add($btnCancel)
+
+    # 共享引用（事件回调用，与主按钮/逃生按钮一致走 form.Tag）
+    $form.Tag.CfgStrip     = $cfgStrip
+    $form.Tag.CfgSummary   = $cfgSummary
+    $form.Tag.CfgUnlockBtn = $btnUnlock
+    $form.Tag.CfgNuds      = $cfgNuds
+    $form.Tag.CfgChk       = $cfgChk
+    $form.Tag.CfgSaveBtn   = $btnSave
+    $form.Tag.CfgCancelBtn = $btnCancel
+    $form.Tag.CfgUnlocked  = $false
+
+    $btnUnlock.Add_Click({
+        param($sender, $e)
+        $f = $sender.FindForm()
+        $tag = $f.Tag
+        $tag.CfgUnlocked = $true
+        $tag.CfgStrip.Visible = $false
+        foreach ($n in $tag.CfgNuds.Values) { $n.Visible = $true }
+        $tag.CfgChk.Visible = $true
+        $tag.CfgSaveBtn.Visible = $true
+        $tag.CfgCancelBtn.Visible = $true
+    })
+
+    $btnSave.Add_Click({
+        param($sender, $e)
+        $f = $sender.FindForm()
+        $tag = $f.Tag
+        $new = @{}
+        foreach ($k in $tag.CfgNuds.Keys) { $new[$k] = [int]$tag.CfgNuds[$k].Value }
+        $new['SkipWeekend'] = $tag.CfgChk.Checked
+        Write-Config $new                                   # 写 config.json；主循环下次轮询重载生效
+        $tag.CfgSummary.Text = '配置 · ' + (Get-ConfigSummary $new)
+        $tag.CfgUnlocked = $false
+        $tag.CfgStrip.Visible = $true
+        foreach ($n in $tag.CfgNuds.Values) { $n.Visible = $false }
+        $tag.CfgChk.Visible = $false
+        $tag.CfgSaveBtn.Visible = $false
+        $tag.CfgCancelBtn.Visible = $false
+    })
+
+    $btnCancel.Add_Click({
+        param($sender, $e)
+        $f = $sender.FindForm()
+        $tag = $f.Tag
+        $tag.CfgUnlocked = $false
+        $tag.CfgStrip.Visible = $true
+        foreach ($n in $tag.CfgNuds.Values) { $n.Visible = $false }
+        $tag.CfgChk.Visible = $false
+        $tag.CfgSaveBtn.Visible = $false
+        $tag.CfgCancelBtn.Visible = $false
+    })
+
     $null = $form.ShowDialog()
     if ($form.Tag.Skipped) { return $null }   # 逃生：调用方当"未确认"处理
     return $form.Tag.Value
@@ -606,6 +904,7 @@ function Start-DialogRunspace {
         [string]$SubMessage = '',
         [string]$InputDefault = '',
         [string]$ExpectedOffworkAt = '',  # 下班弹窗确认时校验，防止旧弹窗串改新一天数据
+        [string]$WorkdayDate = '',        # P1-2: 弹窗所属工作日（yyyy-MM-dd）；跨天确认用它做周末守卫，防止周五弹周六确认被吞
         [int]$WorkEnd = $script:WorkWindowEnd   # R18: 打卡时间上限（提示用；下午到放宽到当前时刻）
     )
 
@@ -619,7 +918,8 @@ function Start-DialogRunspace {
 
         # 注入共享函数（同进程内线程，避免每弹一次起一个新 powershell 进程）
         $null = $ps.AddScript("function Show-MandatoryDialog { $((Get-Command -Name 'Show-MandatoryDialog').Definition) }")
-        $null = $ps.AddScript("function Test-Workday { $((Get-Command -Name 'Test-Workday').Definition) }")
+        $null = $ps.AddScript("function Test-WorkdayAt { $((Get-Command -Name 'Test-WorkdayAt').Definition) }")
+        $null = $ps.AddScript("function Invoke-DataLocked { $((Get-Command -Name 'Invoke-DataLocked').Definition) }")
         $null = $ps.AddScript("function Write-State { $((Get-Command -Name 'Write-State').Definition) }")
         $null = $ps.AddScript("function Read-State { $((Get-Command -Name 'Read-State').Definition) }")
         $null = $ps.AddScript("function Add-HistoryLine { $((Get-Command -Name 'Add-HistoryLine').Definition) }")
@@ -630,9 +930,13 @@ function Start-DialogRunspace {
         $null = $ps.AddScript("function Get-RecordEnd { $((Get-Command -Name 'Get-RecordEnd').Definition) }")
         $null = $ps.AddScript("function Get-RecordMinutes { $((Get-Command -Name 'Get-RecordMinutes').Definition) }")
         $null = $ps.AddScript("function Format-Duration { $((Get-Command -Name 'Format-Duration').Definition) }")
+        $null = $ps.AddScript("function Format-RowDuration { $((Get-Command -Name 'Format-RowDuration').Definition) }")
         $null = $ps.AddScript("function Test-ClockinTimeRange { $((Get-Command -Name 'Test-ClockinTimeRange').Definition) }")
         $null = $ps.AddScript("function Invoke-OffworkConfirm { $((Get-Command -Name 'Invoke-OffworkConfirm').Definition) }")
         $null = $ps.AddScript("function Write-Log { $((Get-Command -Name 'Write-Log').Definition) }")
+        $null = $ps.AddScript("function Read-Config { $((Get-Command -Name 'Read-Config').Definition) }")
+        $null = $ps.AddScript("function Write-Config { $((Get-Command -Name 'Write-Config').Definition) }")
+        $null = $ps.AddScript("function Get-ConfigSummary { $((Get-Command -Name 'Get-ConfigSummary').Definition) }")
 
         $main = @'
 param($ctx)
@@ -643,6 +947,9 @@ $script:DataDir      = $ctx.DataDir
 $script:StateFile    = $ctx.StateFile
 $script:HistoryFile  = $ctx.HistoryFile
 $script:LogFile      = $ctx.LogFile
+$script:ConfigFile   = $ctx.ConfigFile
+$script:DefaultConfig = $ctx.DefaultConfig
+$script:DataMutex    = $ctx.DataMutex
 $script:SkipWeekend  = $ctx.SkipWeekend
 $script:OffWorkHours = $ctx.OffWorkHours
 $script:ReRemindIntervalMinutes = $ctx.ReRemindIntervalMinutes
@@ -661,10 +968,14 @@ if ($null -eq $result) { return }   # 保险：没确认到（正常流程不会
 
 try {
     if ($ctx.Kind -eq 'work') {
-        if (-not (Test-Workday)) { return }   # 弹窗跨天到周末的兜底：周末不写历史
+        # P1-2: 用发起日判断（弹窗跨天到周末不吞确认）；WorkdayDate 为空时 Test-WorkdayAt 回退当前时刻
+        if (-not (Test-WorkdayAt $ctx.WorkdayDate)) { return }
         $clockinDt = [datetime]::ParseExact($result, 'HH:mm', $null)
-        $offworkAt = [datetime]::Today.AddHours($clockinDt.Hour).AddMinutes($clockinDt.Minute).AddHours($ctx.OffWorkHours)
-        $today = (Get-Date).ToString('yyyy-MM-dd')
+        # P1-2: 日期、预计下班都锚定发起日，避免跨天确认时记到/算到第二天
+        $workDate = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($ctx.WorkdayDate, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$workDate)) { $workDate = (Get-Date).Date }
+        $offworkAt = $workDate.AddHours($clockinDt.Hour).AddMinutes($clockinDt.Minute).AddHours($ctx.OffWorkHours)
+        $today = $ctx.WorkdayDate
         $state = Read-State
         if (-not $state) { $state = @{} }
         $state.date = $today
@@ -676,7 +987,8 @@ try {
         Write-State $state
         Add-HistoryLine -date $today -clockin $result -offworkAt $state.offwork_at
     } else {
-        if (-not (Test-Workday)) { return }
+        # P1-2: 用发起日（state.date，周五）判断，周五 23:59 弹、周六 00:01 确认不再被吞
+        if (-not (Test-WorkdayAt $ctx.WorkdayDate)) { return }
         # R15: 确认回写（校验基准防串改；offwork_notified=$false 允许再次提醒；next_remind_at = 确认时间 + 间隔）
         Invoke-OffworkConfirm -ExpectedOffworkAt $ctx.ExpectedOffworkAt -ConfirmedAt (Get-Date) -ReRemindIntervalMinutes $ctx.ReRemindIntervalMinutes
     }
@@ -701,6 +1013,10 @@ try {
             StateFile = $script:StateFile
             HistoryFile = $script:HistoryFile
             LogFile = $script:LogFile
+            ConfigFile = $script:ConfigFile
+            DefaultConfig = $script:DefaultConfig
+            DataMutex = $script:DataMutex
+            WorkdayDate = $WorkdayDate
             ExpectedOffworkAt = $ExpectedOffworkAt
         })
 
@@ -728,6 +1044,7 @@ function Cleanup-DialogRunspaces {
 # ============ 上班打卡流程（异步弹窗；R1/R2/R3/R4 守卫；R18 解锁/启动放宽）============
 function Invoke-WorkReminder {
     param([bool]$AllowLate = $false)          # R18: 解锁/启动触发传 $true，时间窗放宽到 8:00-23:00
+    Reload-Config                                          # R23: 配置变更下次轮询生效
     if (-not (Test-Workday)) { return }                    # R1 周末守卫
     if (-not (Test-WorkAutoWindow -AllowLate $AllowLate)) { return }   # R3/R4 兜底 8-12；R18 解锁/启动放宽
     $state = Read-State
@@ -754,11 +1071,13 @@ function Invoke-WorkReminder {
         -Message "记得飞书打卡上班！`n$statLine" `
         -SubMessage $subMsg `
         -InputDefault $now.ToString('HH:mm') `
+        -WorkdayDate $today `
         -WorkEnd $endHour
 }
 
 # ============ 下班检查（主循环调用；跨天补弹 R8；周末守卫 R1；异步弹窗 R2；加班循环 R15）============
 function Invoke-OffWorkCheck {
+    Reload-Config                                          # R23: 配置变更下次轮询生效
     if (-not (Test-Workday)) { return }                    # R1 周末守卫
     $state = Read-State
     if (-not $state -or $state.offwork_notified) { return }
@@ -813,22 +1132,25 @@ function Invoke-OffWorkCheck {
     }
     $msg += "`n$statLine"
     Start-DialogRunspace -Kind 'offwork' -Title '下班打卡提醒' -Message $msg `
-        -ExpectedOffworkAt $baseRaw
+        -ExpectedOffworkAt $baseRaw `
+        -WorkdayDate $state.date   # P1-2: 弹窗所属工作日（state.date），周五弹周六确认不被吞
 }
 
 # ============ 全天缺勤补记 0 时长（R19）============
 # 补 0 时长行：date,,,,0h 0min（上班/下班空，工作时长 0h 0min）；当天已有行则跳过（去重，防重复补）
 function Add-AbsenceLine {
     param([string]$date)
-    try {
-        if (-not (Test-Path $script:HistoryFile)) {
-            Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
+    Invoke-DataLocked {
+        try {
+            if (-not (Test-Path $script:HistoryFile)) {
+                Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
+            }
+            if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }   # 去重：已有行不重复补
+            Add-Content -Path $script:HistoryFile -Value "$date,,,,0h 0min" -Encoding UTF8
+            Write-Log "补记缺勤：$date 0h 0min"
+        } catch {
+            Write-Log "Add-AbsenceLine 失败: $($_.Exception.Message)"
         }
-        if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }   # 去重：已有行不重复补
-        Add-Content -Path $script:HistoryFile -Value "$date,,,,0h 0min" -Encoding UTF8
-        Write-Log "补记缺勤：$date 0h 0min"
-    } catch {
-        Write-Log "Add-AbsenceLine 失败: $($_.Exception.Message)"
     }
 }
 
@@ -860,8 +1182,20 @@ try {
 }
 if (-not $script:HasMutex) { exit }
 
+# P1-3: 数据文件互斥（与上面的单实例 Mutex 是不同名字）。history/state/config 读写串行化，
+# 防 runspace 弹窗线程与主循环并发写竞态。命名 Mutex 同进程多线程/跨进程共享，runspace 里由 ctx 传入。
+$script:DataMutex = $null
+try {
+    $script:DataMutex = New-Object System.Threading.Mutex($false, "ClockinReminder_Data_$sid")
+} catch {
+    Write-Log "数据互斥创建失败，退化为不加锁: $($_.Exception.Message)"
+}
+
 # ============ 启动 ============
 Ensure-DataDir
+# R21: 启动读 config.json；不存在则用默认值并写出（自动创建）
+if (-not (Test-Path $script:ConfigFile)) { Write-Config $script:DefaultConfig }
+Reload-Config
 Invoke-AbsenceBackfill                          # R19: 启动时补前一天（整天没开电脑漏记 0h 0min）
 $now = Get-Date
 if ((Test-Workday) -and $now.Hour -lt $script:WorkWindowStart) {

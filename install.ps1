@@ -1,24 +1,200 @@
 <#
-  install.ps1  —  一键安装打卡提醒工具（Windows）
+  install.ps1  —  一键安装打卡提醒工具（Windows）v7
   用法：powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
   或右键「使用 PowerShell 运行」。
   作用：
+    0. 弹配置表单（可改配置，确定后写 config.json）
     1. 拷贝 clockin-reminder.ps1、manual-clockin.ps1 到 %USERPROFILE%\.clockin-reminder\
     2. 注册开机自启（HKCU Run，无需管理员）
     3. 立即启动常驻脚本
   说明：report.ps1 不用安装，拷到任意目录命令行运行即可（数据读 %USERPROFILE%\.clockin-reminder\）
+  R22：安装前先弹 WinForms 配置表单；预填已存在的 config.json（重装时保留当前配置）
 #>
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 
 $srcDir    = $PSScriptRoot
 $dstDir    = Join-Path $env:USERPROFILE '.clockin-reminder'
 $scriptPath = Join-Path $dstDir 'clockin-reminder.ps1'
+$configFile = Join-Path $dstDir 'config.json'
+
+# ============ R22: 配置表单 ============
+# 默认配置（与主脚本 clockin-reminder.ps1 的 DefaultConfig 保持一致）
+$script:DefaultConfig = @{
+    OffWorkHours             = 10
+    WorkWindowStart          = 8
+    WorkWindowEnd            = 10
+    WorkAutoPopupEnd         = 12
+    SkipWeekend              = $true
+    ReRemindIntervalMinutes  = 30
+    MaxRemindHour            = 23
+}
+
+# 读已有 config.json 预填（支持重装时保留当前配置）；文件不存在/解析失败用默认
+function Read-ExistingConfig {
+    param([string]$Path)
+    $cfg = @{}
+    foreach ($k in $script:DefaultConfig.Keys) { $cfg[$k] = $script:DefaultConfig[$k] }
+    if (Test-Path $Path) {
+        try {
+            $obj = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $obj) {
+                foreach ($p in $obj.PSObject.Properties) {
+                    if ($cfg.ContainsKey($p.Name)) { $cfg[$p.Name] = $p.Value }
+                }
+            }
+        } catch { }
+    }
+    return $cfg
+}
+
+# 写 config.json（原子写）
+function Write-ConfigFile {
+    param([string]$Path, $cfg)
+    $dir = Split-Path $Path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = "$Path.tmp"
+    $cfg | ConvertTo-Json | Set-Content -Path $tmp -Encoding UTF8
+    Move-Item -Path $tmp -Destination $Path -Force
+}
+
+# 配置表单：确定返回写入的 config hashtable；取消/关闭返回 $null（用默认值，不写 config.json）
+function Show-ConfigForm {
+    param($cfg)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = '打卡提醒 · 安装配置'
+    $form.Size = New-Object System.Drawing.Size(640, 580)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.BackColor = [System.Drawing.Color]::FromArgb(255, 255, 0)   # 与主脚本一致的黄底
+    $form.KeyPreview = $true
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = '打卡提醒工具 · 安装配置'
+    $title.Font = New-Object System.Drawing.Font('Microsoft YaHei', 18, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = [System.Drawing.Color]::Red
+    $title.BackColor = $form.BackColor
+    $title.SetBounds(24, 18, 580, 42)
+    $form.Controls.Add($title)
+
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = '以下配置写入 config.json，装好后也可在上班/下班弹窗底部「解锁更改配置」再次修改'
+    $hint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10, [System.Drawing.FontStyle]::Regular)
+    $hint.ForeColor = [System.Drawing.Color]::FromArgb(170, 0, 0)
+    $hint.BackColor = $form.BackColor
+    $hint.SetBounds(26, 66, 580, 26)
+    $form.Controls.Add($hint)
+
+    $fields = @(
+        @{ Name = 'OffWorkHours';            Label = '下班提醒 = 上班打卡 + 几小时'; Min = 1;  Max = 23 },
+        @{ Name = 'WorkWindowStart';         Label = '上班提醒最早时间（点）';        Min = 0;  Max = 12 },
+        @{ Name = 'WorkWindowEnd';           Label = '打卡时间最晚（点）';            Min = 1;  Max = 23 },
+        @{ Name = 'WorkAutoPopupEnd';        Label = '上班自动提醒最晚（点）';        Min = 1;  Max = 23 },
+        @{ Name = 'ReRemindIntervalMinutes'; Label = '下班循环提醒间隔（分钟）';      Min = 1;  Max = 480 },
+        @{ Name = 'MaxRemindHour';           Label = '最晚自动提醒小时（点）';        Min = 0;  Max = 23 }
+    )
+
+    $nuds = @{}
+    $y = 106
+    foreach ($f in $fields) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $f.Label
+        $lbl.Font = New-Object System.Drawing.Font('Microsoft YaHei', 11, [System.Drawing.FontStyle]::Regular)
+        $lbl.ForeColor = [System.Drawing.Color]::FromArgb(150, 0, 0)
+        $lbl.BackColor = $form.BackColor
+        $lbl.SetBounds(26, $y, 360, 34)
+        $form.Controls.Add($lbl)
+
+        $nud = New-Object System.Windows.Forms.NumericUpDown
+        $nud.Minimum = $f.Min
+        $nud.Maximum = $f.Max
+        $nud.Value = [Math]::Max($f.Min, [Math]::Min($f.Max, [int]$cfg[$f.Name]))
+        $nud.Font = New-Object System.Drawing.Font('Microsoft YaHei', 12, [System.Drawing.FontStyle]::Regular)
+        $nud.SetBounds(402, $y, 180, 30)
+        $form.Controls.Add($nud)
+        $nuds[$f.Name] = $nud
+        $y += 46
+    }
+
+    $chk = New-Object System.Windows.Forms.CheckBox
+    $chk.Text = '周末跳过（不提醒、不写历史）'
+    $chk.Checked = [bool]$cfg.SkipWeekend
+    $chk.Font = New-Object System.Drawing.Font('Microsoft YaHei', 11, [System.Drawing.FontStyle]::Regular)
+    $chk.ForeColor = [System.Drawing.Color]::FromArgb(150, 0, 0)
+    $chk.SetBounds(26, ($y + 4), 380, 32)
+    $form.Controls.Add($chk)
+    $y += 50
+
+    $btnOk = New-Object System.Windows.Forms.Button
+    $btnOk.Text = '确定（保存配置并安装）'
+    $btnOk.Font = New-Object System.Drawing.Font('Microsoft YaHei', 12, [System.Drawing.FontStyle]::Bold)
+    $btnOk.ForeColor = [System.Drawing.Color]::Red
+    $btnOk.BackColor = [System.Drawing.Color]::White
+    $btnOk.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnOk.SetBounds(120, $y, 220, 42)
+    $form.Controls.Add($btnOk)
+    $form.AcceptButton = $btnOk
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = '取消（用默认值）'
+    $btnCancel.Font = New-Object System.Drawing.Font('Microsoft YaHei', 12, [System.Drawing.FontStyle]::Regular)
+    $btnCancel.ForeColor = [System.Drawing.Color]::FromArgb(150, 0, 0)
+    $btnCancel.BackColor = [System.Drawing.Color]::White
+    $btnCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnCancel.SetBounds(352, $y, 210, 42)
+    $form.Controls.Add($btnCancel)
+
+    $btnOk.Add_Click({
+        param($sender, $e)
+        # 校验：数值范围由 NumericUpDown 保证；再做交叉校验（上班最早不能晚于自动弹最晚 / 打卡最晚）
+        if ($nuds['WorkWindowStart'].Value -gt $nuds['WorkAutoPopupEnd'].Value) {
+            [System.Windows.Forms.MessageBox]::Show('上班提醒最早时间不能晚于上班自动提醒最晚时间', '配置错误',
+                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            return
+        }
+        if ($nuds['WorkWindowStart'].Value -gt $nuds['WorkWindowEnd'].Value) {
+            [System.Windows.Forms.MessageBox]::Show('上班提醒最早时间不能晚于打卡时间最晚', '配置错误',
+                [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            return
+        }
+        $new = @{}
+        foreach ($k in $nuds.Keys) { $new[$k] = [int]$nuds[$k].Value }
+        $new['SkipWeekend'] = $chk.Checked
+        $f = $sender.FindForm()
+        $f.Tag = $new
+        $f.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    })
+    $btnCancel.Add_Click({
+        param($sender, $e)
+        $f = $sender.FindForm()
+        $f.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    })
+
+    $null = $form.ShowDialog()
+    if ($form.DialogResult -eq [System.Windows.Forms.DialogResult]::OK) { return $form.Tag }
+    return $null
+}
 
 # 0. 停掉旧实例（按命令行匹配，避免重复实例双弹窗；兼容 powershell.exe 和 pwsh.exe）
 Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*clockin-reminder.ps1*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+# 0.5 R22: 弹配置表单；确定则写 config.json，取消用默认（不写，主脚本首次运行自动创建默认）
+$cfgResult = Show-ConfigForm -cfg (Read-ExistingConfig -Path $configFile)
+if ($null -ne $cfgResult) {
+    Write-ConfigFile -Path $configFile -cfg $cfgResult
+    Write-Host ''
+    Write-Host "[OK] 配置已保存 -> $configFile" -ForegroundColor Green
+} else {
+    Write-Host ''
+    Write-Host '[提示] 已取消，使用默认配置（首次运行主脚本会自动创建 config.json）' -ForegroundColor Yellow
+}
 
 # 1. 拷贝主脚本 + 手动打卡脚本
 if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
@@ -36,6 +212,7 @@ Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Execut
 Write-Host ''
 Write-Host '[OK] 打卡提醒工具已安装并启动' -ForegroundColor Green
 Write-Host "  脚本目录 : $dstDir"
+Write-Host '  配置文件 : config.json（弹窗底部「解锁更改配置」可再次修改）'
 Write-Host '  手动打卡 : 双击 manual-clockin.ps1（周末加班记录）'
 Write-Host '  统计报告 : powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1'
 Write-Host '  测试方法 : Win+L 锁屏再解锁，应弹出上班打卡提醒'
