@@ -11,7 +11,7 @@
     7. offwork_actual 同一天多次确认取最晚（R16）
   数据文件：%USERPROFILE%\.clockin-reminder\
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
-    history.csv  历史记录（date,clockin_time,offwork_at,offwork_actual,duration；v5 起 offwork 时间只存 HH:mm）
+    history.csv  历史记录（日期,上班时间,预计下班,实际下班,工作时长；v5 起 offwork 时间只存 HH:mm）
     log.txt      异常日志
   运行：
     powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File clockin-reminder.ps1
