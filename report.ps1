@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  report.ps1  —  打卡时长统计报告（纯文本，不弹窗，v3）
+  report.ps1  —  打卡时长统计报告（纯文本，不弹窗，v5）
   用法（Windows PowerShell 5.1+）：
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1            # 本周（默认）
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Week
@@ -9,7 +9,8 @@
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Days 7
   说明：
     - 数据来自 %USERPROFILE%\.clockin-reminder\history.csv
-    - 兼容 3 列（旧）/4 列（新）；offwork_actual 为空时回退 offwork_at（预计值）
+    - 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5）；offwork_actual 为空时回退 offwork_at（预计值）
+    - v5: offwork 时间只存 HH:mm；跨天（end < start）视为次日（与主脚本 Get-RecordEnd 一致）
     - 周 = 周一~周日；工作日合计（周一~周五）用于 50h 达标，周末加班单列
     - 解析失败的行跳过并在末尾提示行号
 #>
@@ -18,7 +19,8 @@ param(
     [switch]$Month,
     [switch]$All,
     [int]$Days = 0,
-    [switch]$Gui
+    [switch]$Gui,
+    [switch]$Save
 )
 $ErrorActionPreference = 'Stop'
 
@@ -48,6 +50,7 @@ function Read-HistoryRows {
             clockin        = $(if ($cols.Count -ge 2) { $cols[1].Trim() } else { '' })
             offwork_at     = $(if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' })
             offwork_actual = $(if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' })
+            duration       = $(if ($cols.Count -ge 5) { $cols[4].Trim() } else { '' })
         }
     }
     return $rows
@@ -72,11 +75,19 @@ function Get-RecordStart {
     return $null
 }
 
+# v5: offwork 时间 CSV 里只存 HH:mm；与 start 组合做跨天推断（end < start → +1 天，C1）；旧格式完整 datetime 仍兼容
 function Get-RecordEnd {
-    param($row)
+    param($row, $start)
     $s = $row.offwork_actual
     if ([string]::IsNullOrWhiteSpace($s)) { $s = $row.offwork_at }
     if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    $t = [datetime]::MinValue
+    if ([datetime]::TryParseExact($s, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
+        if ($null -eq $start) { return $null }
+        $end = $start.Date.Add($t.TimeOfDay)
+        if ($end -lt $start) { $end = $end.AddDays(1) }   # C1: end < start → 视为次日
+        return $end
+    }
     $dt = [datetime]::MinValue
     if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
     if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
@@ -86,8 +97,9 @@ function Get-RecordEnd {
 function Get-RecordMinutes {
     param($row)
     $start = Get-RecordStart $row
-    $end = Get-RecordEnd $row
-    if ($null -eq $start -or $null -eq $end) { return $null }
+    if ($null -eq $start) { return $null }
+    $end = Get-RecordEnd -row $row -start $start
+    if ($null -eq $end) { return $null }
     $diff = $end - $start
     if ($diff.TotalMinutes -lt 0) { $diff = [TimeSpan]::Zero }
     return $diff.TotalMinutes
@@ -142,7 +154,7 @@ function Write-DayDetail {
     }
     foreach ($row in $dayRows) {
         $start = Get-RecordStart $row
-        $end = Get-RecordEnd $row
+        $end = Get-RecordEnd -row $row -start $start
         $min = Get-RecordMinutes $row
         if ($null -eq $start) {
             $null = $lines.Add(("  {0} {1:MM-dd}  缺上班卡" -f (Get-WeekdayName $day), $day))
@@ -209,7 +221,7 @@ function Show-AllReport {
         $rd = ConvertTo-StatsDate $row.date
         if ($null -eq $rd) { continue }
         $start = Get-RecordStart $row
-        $end = Get-RecordEnd $row
+        $end = Get-RecordEnd -row $row -start $start
         $min = Get-RecordMinutes $row
         if ($null -eq $start) {
             Write-Output ("  {0:yyyy-MM-dd}（{1}）  缺上班卡" -f $rd, (Get-WeekdayName $rd))
@@ -284,4 +296,14 @@ if ($Gui) {
     $null = $form.ShowDialog()
 } else {
     $report | ForEach-Object { Write-Output $_ }
+}
+
+# -Save：把统计报告内容同时写入 report-<日期>.csv（bat 调用时默认保存）
+if ($Save) {
+    $savePath = Join-Path $script:DataDir ("report-{0:yyyyMMdd}.csv" -f (Get-Date))
+    try {
+        $report | Set-Content -Path $savePath -Encoding UTF8
+    } catch {
+        Write-Warning "保存统计到 $savePath 失败: $($_.Exception.Message)"
+    }
 }

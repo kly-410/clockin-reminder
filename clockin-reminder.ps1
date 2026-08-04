@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v4)
+  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v5)
   功能：
     1. 工作日(周一~周五)才提醒；周六/周日不弹任何提醒、不写 history（R1）
     2. 8 点前不轮询（睡到 8:00）；8:00-12:00 之间由主循环兜底弹上班提醒（R3/R4）
@@ -11,7 +11,7 @@
     7. offwork_actual 同一天多次确认取最晚（R16）
   数据文件：%USERPROFILE%\.clockin-reminder\
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
-    history.csv  历史记录（date,clockin_time,offwork_at,offwork_actual）
+    history.csv  历史记录（date,clockin_time,offwork_at,offwork_actual,duration；v5 起 offwork 时间只存 HH:mm）
     log.txt      异常日志
   运行：
     powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File clockin-reminder.ps1
@@ -49,7 +49,7 @@ function Write-Log {
 # ============ 数据 ============
 function Ensure-DataDir {
     if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
-    if (-not (Test-Path $script:HistoryFile)) { Set-Content -Path $script:HistoryFile -Value 'date,clockin_time,offwork_at,offwork_actual' -Encoding UTF8 }
+    if (-not (Test-Path $script:HistoryFile)) { Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8 }
 }
 
 # 读取 state.json；统一转成 hashtable，避免 PSCustomObject 加属性报错（R5）
@@ -76,22 +76,28 @@ function Write-State($state) {
 }
 
 # 写入历史前先去重：当天已有行则跳过（R9）
+# v5: 5 列，offwork_at 只存 HH:mm（去掉日期）；写上班卡时同时算 duration（缺实际下班回退预计 offwork_at）
 function Add-HistoryLine {
     param([string]$date, [string]$clockin, [string]$offworkAt)
     try {
         if (-not (Test-Path $script:HistoryFile)) {
-            Set-Content -Path $script:HistoryFile -Value 'date,clockin_time,offwork_at,offwork_actual' -Encoding UTF8
+            Set-Content -Path $script:HistoryFile -Value '日期,上班时间,预计下班,实际下班,工作时长' -Encoding UTF8
         }
         if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }
-        # R10: 4 列，offwork_actual 留空，待下班确认时回填
-        Add-Content -Path $script:HistoryFile -Value "$date,$clockin,$offworkAt," -Encoding UTF8
+        $offTime = ConvertTo-HHmm $offworkAt
+        $durStr = ''
+        $row = [pscustomobject]@{ date = $date; clockin = $clockin; offwork_at = $offTime; offwork_actual = '' }
+        $min = Get-RecordMinutes $row
+        if ($null -ne $min) { $durStr = Format-Duration $min }
+        Add-Content -Path $script:HistoryFile -Value "$date,$clockin,$offTime,,$durStr" -Encoding UTF8
     } catch {
         Write-Log "Add-HistoryLine 失败: $($_.Exception.Message)"
     }
 }
 
 # ============ 历史统计（R10/R11）============
-# history.csv 兼容 3 列（旧）/4 列（新）；offwork_actual 为空时回退 offwork_at（预计值）
+# history.csv 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5）；offwork_actual 为空时回退 offwork_at（预计值）
+# v5: offwork_at / offwork_actual 在 CSV 里只存 HH:mm（日期由第一列 date 提供）；跨天推断见 Get-RecordEnd
 
 # 读取 history.csv 为行对象数组；解析失败的行跳过并记行号（供 report 提示）
 function Read-HistoryRows {
@@ -115,6 +121,7 @@ function Read-HistoryRows {
             clockin        = $(if ($cols.Count -ge 2) { $cols[1].Trim() } else { '' })
             offwork_at     = $(if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' })
             offwork_actual = $(if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' })
+            duration       = $(if ($cols.Count -ge 5) { $cols[4].Trim() } else { '' })
         }
     }
     return $rows
@@ -126,6 +133,17 @@ function ConvertTo-StatsDate {
     $dt = [datetime]::MinValue
     if ([datetime]::TryParseExact($s, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
     return $null
+}
+
+# v5: 把 offwork 时间统一转成 HH:mm（兼容 HH:mm / 旧格式 yyyy-MM-dd HH:mm:ss / yyyy-MM-dd HH:mm）
+function ConvertTo-HHmm {
+    param([string]$s)
+    if ([string]::IsNullOrWhiteSpace($s)) { return '' }
+    $t = [datetime]::MinValue
+    if ([datetime]::TryParseExact($s, [string[]]@('HH:mm:ss', 'HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) { return $t.ToString('HH:mm') }
+    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) { return $t.ToString('HH:mm') }
+    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) { return $t.ToString('HH:mm') }
+    return $s
 }
 
 # 记录开始时间 = 该行 date + clockin（HH:mm）
@@ -141,11 +159,22 @@ function Get-RecordStart {
 }
 
 # 记录结束时间：优先 offwork_actual，为空回退 offwork_at（预计值）
+# v5: offwork 时间在 CSV 里只有 HH:mm → 与 start 同一天组合；若 end < start 视为跨天（+1 天，C1）
+#     旧格式（完整 yyyy-MM-dd HH:mm:ss，日期内嵌）仍兼容，无需跨天推断
 function Get-RecordEnd {
-    param($row)
+    param($row, $start)
     $s = $row.offwork_actual
     if ([string]::IsNullOrWhiteSpace($s)) { $s = $row.offwork_at }
     if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    # v5 纯时间（HH:mm）
+    $t = [datetime]::MinValue
+    if ([datetime]::TryParseExact($s, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
+        if ($null -eq $start) { return $null }
+        $end = $start.Date.Add($t.TimeOfDay)
+        if ($end -lt $start) { $end = $end.AddDays(1) }   # C1: end < start → 视为次日
+        return $end
+    }
+    # 旧格式完整 datetime
     $dt = [datetime]::MinValue
     if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
     if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
@@ -156,8 +185,9 @@ function Get-RecordEnd {
 function Get-RecordMinutes {
     param($row)
     $start = Get-RecordStart $row
-    $end = Get-RecordEnd $row
-    if ($null -eq $start -or $null -eq $end) { return $null }
+    if ($null -eq $start) { return $null }
+    $end = Get-RecordEnd -row $row -start $start
+    if ($null -eq $end) { return $null }
     $diff = $end - $start
     if ($diff.TotalMinutes -lt 0) { $diff = [TimeSpan]::Zero }
     return $diff.TotalMinutes
@@ -275,6 +305,7 @@ function Get-StateTodayMinutes {
 }
 
 # R10/R16: 下班确认后把实际确认时间写入 history.csv 对应行（offwork_actual 列，取最晚）
+# v5: offwork_actual 只存 HH:mm；确认后重算该行 duration 列（取最晚后时长可能变）
 function Set-HistoryOffworkActual {
     param([string]$date, [string]$actual)
     try {
@@ -288,17 +319,26 @@ function Set-HistoryOffworkActual {
                 $c2 = if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' }
                 $c3 = if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' }
                 # R16: 同一天多次下班打卡只取最晚——已有更晚记录则跳过（写日志）
+                # v5: 用跨天推断把已有 HH:mm 还原成完整 end 再比较（00:30 次日 > 23:50 当天）
                 if (-not [string]::IsNullOrWhiteSpace($c3)) {
-                    $exDt = [datetime]::MinValue
+                    $exRow = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $c3 }
+                    $exStart = Get-RecordStart $exRow
+                    $exEnd = Get-RecordEnd -row $exRow -start $exStart
                     $newDt = [datetime]::MinValue
-                    $exOk = [datetime]::TryParseExact($c3, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$exDt)
-                    $newOk = [datetime]::TryParseExact($actual, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$newDt)
-                    if ($exOk -and $newOk -and $newDt -le $exDt) {
+                    if ($null -ne $exEnd -and
+                        [datetime]::TryParseExact($actual, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$newDt) -and
+                        $newDt -le $exEnd) {
                         Write-Log "Set-HistoryOffworkActual 跳过：$date 已有更晚下班记录 $c3，新时间 $actual 不覆盖"
                         continue
                     }
                 }
-                $lines[$i] = "$date,$c1,$c2,$actual"
+                # v5: 只存 HH:mm；用 Get-RecordMinutes 重算 duration（优先 actual，空则回退 at）
+                $actualHHmm = ConvertTo-HHmm $actual
+                $durStr = ''
+                $row = [pscustomobject]@{ date = $date; clockin = $c1; offwork_at = $c2; offwork_actual = $actualHHmm }
+                $min = Get-RecordMinutes $row
+                if ($null -ne $min) { $durStr = Format-Duration $min }
+                $lines[$i] = "$date,$c1,$c2,$actualHHmm,$durStr"
                 $changed = $true
             }
         }
@@ -557,6 +597,12 @@ function Start-DialogRunspace {
         $null = $ps.AddScript("function Read-State { $((Get-Command -Name 'Read-State').Definition) }")
         $null = $ps.AddScript("function Add-HistoryLine { $((Get-Command -Name 'Add-HistoryLine').Definition) }")
         $null = $ps.AddScript("function Set-HistoryOffworkActual { $((Get-Command -Name 'Set-HistoryOffworkActual').Definition) }")
+        $null = $ps.AddScript("function ConvertTo-HHmm { $((Get-Command -Name 'ConvertTo-HHmm').Definition) }")
+        $null = $ps.AddScript("function ConvertTo-StatsDate { $((Get-Command -Name 'ConvertTo-StatsDate').Definition) }")
+        $null = $ps.AddScript("function Get-RecordStart { $((Get-Command -Name 'Get-RecordStart').Definition) }")
+        $null = $ps.AddScript("function Get-RecordEnd { $((Get-Command -Name 'Get-RecordEnd').Definition) }")
+        $null = $ps.AddScript("function Get-RecordMinutes { $((Get-Command -Name 'Get-RecordMinutes').Definition) }")
+        $null = $ps.AddScript("function Format-Duration { $((Get-Command -Name 'Format-Duration').Definition) }")
         $null = $ps.AddScript("function Invoke-OffworkConfirm { $((Get-Command -Name 'Invoke-OffworkConfirm').Definition) }")
         $null = $ps.AddScript("function Write-Log { $((Get-Command -Name 'Write-Log').Definition) }")
 
@@ -757,13 +803,13 @@ if ((Test-Workday) -and $now.Hour -lt $script:WorkWindowStart) {
     $eight = [datetime]::Today.AddHours($script:WorkWindowStart)
     Start-Sleep -Seconds ([int](($eight - $now).TotalSeconds) + 1)
 }
-# 8:00-12:00 启动：由主循环 15 秒内兜底触发（R3）；12 点后启动当天不自动弹（R4）
+# 8:00-12:00 启动：由主循环 2 分钟内兜底触发（R3）；12 点后启动当天不自动弹（R4）
 
-# ============ 主循环（15 秒轮询；try/catch 防脚本自杀 R5）============
+# ============ 主循环（2 分钟轮询；try/catch 防脚本自杀 R5）============
 $prevLocked = Test-Locked
 while ($true) {
     try {
-        Start-Sleep -Seconds 15
+        Start-Sleep -Seconds 120
         Invoke-OffWorkCheck
         Invoke-WorkReminder              # R3 每天 8 点兜底（不依赖启动/解锁事件；跨天常驻第二天 8 点也能弹）
         Cleanup-DialogRunspaces
