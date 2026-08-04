@@ -1,14 +1,15 @@
 #Requires -Version 5.1
 <#
-  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v2)
+  clockin-reminder.ps1  —  打卡提醒常驻脚本 (v3)
   功能：
     1. 工作日(周一~周五)才提醒；周六/周日不弹任何提醒、不写 history（R1）
     2. 8 点前不轮询（睡到 8:00）；8:00-12:00 之间由主循环兜底弹上班提醒（R3/R4）
     3. 上班/下班弹窗在独立 runspace 线程中运行，不阻塞主循环（R2）
     4. 打卡时间 + 10 小时后主循环弹下班提醒；跨天未确认的下班提醒在工作日补弹（R8）
+    5. 下班确认把实际时间写入 history.csv；下班弹窗附带今日/本周工作时长统计（R10/R12）
   数据文件：%USERPROFILE%\.clockin-reminder\
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified）
-    history.csv  历史记录（date,clockin_time,offwork_at）
+    history.csv  历史记录（date,clockin_time,offwork_at,offwork_actual）
     log.txt      异常日志
   运行：
     powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File clockin-reminder.ps1
@@ -31,6 +32,7 @@ $script:LogFile           = Join-Path $script:DataDir 'log.txt'
 
 # 进行中的弹窗 runspace 引用，防止被垃圾回收杀掉弹窗线程
 $script:PendingPopups = [System.Collections.ArrayList]::new()
+$script:SkippedLines  = New-Object System.Collections.ArrayList   # 历史解析失败行号（容错用）
 
 # ============ 日志 ============
 function Write-Log {
@@ -43,7 +45,7 @@ function Write-Log {
 # ============ 数据 ============
 function Ensure-DataDir {
     if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
-    if (-not (Test-Path $script:HistoryFile)) { Set-Content -Path $script:HistoryFile -Value 'date,clockin_time,offwork_at' -Encoding UTF8 }
+    if (-not (Test-Path $script:HistoryFile)) { Set-Content -Path $script:HistoryFile -Value 'date,clockin_time,offwork_at,offwork_actual' -Encoding UTF8 }
 }
 
 # 读取 state.json；统一转成 hashtable，避免 PSCustomObject 加属性报错（R5）
@@ -74,12 +76,223 @@ function Add-HistoryLine {
     param([string]$date, [string]$clockin, [string]$offworkAt)
     try {
         if (-not (Test-Path $script:HistoryFile)) {
-            Set-Content -Path $script:HistoryFile -Value 'date,clockin_time,offwork_at' -Encoding UTF8
+            Set-Content -Path $script:HistoryFile -Value 'date,clockin_time,offwork_at,offwork_actual' -Encoding UTF8
         }
         if (Select-String -Path $script:HistoryFile -Pattern "^$date," -Quiet) { return }
-        Add-Content -Path $script:HistoryFile -Value "$date,$clockin,$offworkAt" -Encoding UTF8
+        # R10: 4 列，offwork_actual 留空，待下班确认时回填
+        Add-Content -Path $script:HistoryFile -Value "$date,$clockin,$offworkAt," -Encoding UTF8
     } catch {
         Write-Log "Add-HistoryLine 失败: $($_.Exception.Message)"
+    }
+}
+
+# ============ 历史统计（R10/R11）============
+# history.csv 兼容 3 列（旧）/4 列（新）；offwork_actual 为空时回退 offwork_at（预计值）
+
+# 读取 history.csv 为行对象数组；解析失败的行跳过并记行号（供 report 提示）
+function Read-HistoryRows {
+    param([string]$Path = $script:HistoryFile)
+    $rows = @()
+    if (-not (Test-Path $Path)) { return $rows }
+    $lines = @(Get-Content -Path $Path -Encoding UTF8)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($i -eq 0) { continue }   # 表头
+        $line = $lines[$i]
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $cols = $line.Split(',')
+        $d = [datetime]::MinValue
+        $dateOk = $cols.Count -ge 1 -and [datetime]::TryParseExact($cols[0].Trim(), 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$d)
+        if ($cols.Count -lt 3 -or -not $dateOk) {
+            $null = $script:SkippedLines.Add($i + 1)
+            continue
+        }
+        $rows += [pscustomobject]@{
+            date           = $cols[0].Trim()
+            clockin        = $(if ($cols.Count -ge 2) { $cols[1].Trim() } else { '' })
+            offwork_at     = $(if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' })
+            offwork_actual = $(if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' })
+        }
+    }
+    return $rows
+}
+
+function ConvertTo-StatsDate {
+    param([string]$s)
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+    return $null
+}
+
+# 记录开始时间 = 该行 date + clockin（HH:mm）
+function Get-RecordStart {
+    param($row)
+    $d = ConvertTo-StatsDate $row.date
+    if ($null -eq $d) { return $null }
+    $t = [datetime]::MinValue
+    if ([datetime]::TryParseExact($row.clockin, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
+        return $d.Date.Add($t.TimeOfDay)
+    }
+    return $null
+}
+
+# 记录结束时间：优先 offwork_actual，为空回退 offwork_at（预计值）
+function Get-RecordEnd {
+    param($row)
+    $s = $row.offwork_actual
+    if ([string]::IsNullOrWhiteSpace($s)) { $s = $row.offwork_at }
+    if ([string]::IsNullOrWhiteSpace($s)) { return $null }
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+    if ([datetime]::TryParseExact($s, 'yyyy-MM-dd HH:mm', $null, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+    return $null
+}
+
+# 单条记录时长（分钟）；缺上班或下班时间返回 $null
+function Get-RecordMinutes {
+    param($row)
+    $start = Get-RecordStart $row
+    $end = Get-RecordEnd $row
+    if ($null -eq $start -or $null -eq $end) { return $null }
+    $diff = $end - $start
+    if ($diff.TotalMinutes -lt 0) { $diff = [TimeSpan]::Zero }
+    return $diff.TotalMinutes
+}
+
+# 时长显示：Xh Ym（如 10h 05m）
+function Format-Duration {
+    param([double]$Minutes)
+    if ($Minutes -lt 0) { $Minutes = 0 }
+    $total = [math]::Round($Minutes)
+    $h = [math]::Floor($total / 60)
+    $m = $total % 60
+    return ('{0}h {1:00}m' -f $h, $m)
+}
+
+function Test-Weekend {
+    param([datetime]$d)
+    $dow = $d.DayOfWeek
+    return ($dow -eq [DayOfWeek]::Saturday) -or ($dow -eq [DayOfWeek]::Sunday)
+}
+
+# 所在周的周一/周日（周一到周日）
+function Get-WeekRange {
+    param([datetime]$d)
+    $daysSinceMonday = ([int]$d.DayOfWeek + 6) % 7
+    $monday = $d.Date.AddDays(-$daysSinceMonday)
+    return @{ Monday = $monday; Sunday = $monday.AddDays(6) }
+}
+
+function Get-WeekdayName {
+    param([datetime]$d)
+    switch ([int]$d.DayOfWeek) {
+        0 { return '周日' }
+        1 { return '周一' }
+        2 { return '周二' }
+        3 { return '周三' }
+        4 { return '周四' }
+        5 { return '周五' }
+        6 { return '周六' }
+    }
+}
+
+# 某周统计：Weekday=周一~周五合计（用于 50h 达标），Weekend=周末加班单列
+function Get-WeekStats {
+    param([datetime]$d)
+    $range = Get-WeekRange $d
+    $rows = @(Read-HistoryRows)
+    $weekday = 0.0
+    $weekend = 0.0
+    foreach ($row in $rows) {
+        $rd = ConvertTo-StatsDate $row.date
+        if ($null -eq $rd) { continue }
+        if ($rd -lt $range.Monday -or $rd -gt $range.Sunday) { continue }
+        $min = Get-RecordMinutes $row
+        if ($null -eq $min) { continue }
+        if (Test-Weekend $rd) { $weekend += $min } else { $weekday += $min }
+    }
+    return @{ Weekday = $weekday; Weekend = $weekend; Total = $weekday + $weekend }
+}
+
+# 某自然月统计：Weekday=工作日合计，Weekend=周末加班，Total=合计
+function Get-MonthStats {
+    param([datetime]$d)
+    $rows = @(Read-HistoryRows)
+    $weekday = 0.0
+    $weekend = 0.0
+    foreach ($row in $rows) {
+        $rd = ConvertTo-StatsDate $row.date
+        if ($null -eq $rd) { continue }
+        if ($rd.Year -ne $d.Year -or $rd.Month -ne $d.Month) { continue }
+        $min = Get-RecordMinutes $row
+        if ($null -eq $min) { continue }
+        if (Test-Weekend $rd) { $weekend += $min } else { $weekday += $min }
+    }
+    return @{ Weekday = $weekday; Weekend = $weekend; Total = $weekday + $weekend }
+}
+
+# 统计摘要行（上班/下班弹窗共用）：本周工作日累计 + 50h 达标 + 本月累计
+function Get-StatsSummaryLine {
+    $now = Get-Date
+    $wk = Get-WeekStats $now
+    $mo = Get-MonthStats $now
+    $parts = New-Object System.Collections.ArrayList
+    $null = $parts.Add("本周工作日 $(Format-Duration $wk.Weekday)")
+    if ($wk.Weekday -ge 3000) {
+        $null = $parts.Add('✅ 达标 (≥50h)')
+    } else {
+        $null = $parts.Add("还差 $(Format-Duration (3000 - $wk.Weekday)) 达 50h")
+    }
+    $null = $parts.Add("本月 $(Format-Duration $mo.Total)")
+    return ($parts -join ' ｜ ')
+}
+
+# 今日工作时长：state 里 date+clockin 到当前时刻；跨天补弹（非当天）用预计 offwork_at
+function Get-StateTodayMinutes {
+    param($state)
+    try {
+        if (-not $state -or [string]::IsNullOrWhiteSpace($state.date) -or [string]::IsNullOrWhiteSpace($state.clockin_time)) { return $null }
+        $d = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact([string]$state.date, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return $null }
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact([string]$state.clockin_time, [string[]]@('HH:mm', 'H:mm'), $null, [System.Globalization.DateTimeStyles]::None, [ref]$t)) { return $null }
+        $start = $d.Date.Add($t.TimeOfDay)
+        if ($d.Date -eq (Get-Date).Date) {
+            $diff = (Get-Date) - $start
+        } else {
+            if ([string]::IsNullOrWhiteSpace($state.offwork_at)) { return $null }
+            $off = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact([string]$state.offwork_at, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$off)) { return $null }
+            $diff = $off - $start
+        }
+        if ($diff.TotalMinutes -lt 0) { return 0 }
+        return $diff.TotalMinutes
+    } catch { return $null }
+}
+
+# R10: 下班确认后把实际确认时间写入 history.csv 对应行（写 offwork_actual 列）
+function Set-HistoryOffworkActual {
+    param([string]$date, [string]$actual)
+    try {
+        if (-not (Test-Path $script:HistoryFile)) { return }
+        $lines = @(Get-Content -Path $script:HistoryFile -Encoding UTF8)
+        $changed = $false
+        for ($i = 1; $i -lt $lines.Count; $i++) {
+            $cols = $lines[$i].Split(',')
+            if ($cols.Count -ge 1 -and $cols[0].Trim() -eq $date) {
+                $c1 = if ($cols.Count -ge 2) { $cols[1].Trim() } else { '' }
+                $c2 = if ($cols.Count -ge 3) { $cols[2].Trim() } else { '' }
+                $lines[$i] = "$date,$c1,$c2,$actual"
+                $changed = $true
+            }
+        }
+        if ($changed) {
+            $tmp = "$($script:HistoryFile).tmp"
+            $lines | Set-Content -Path $tmp -Encoding UTF8
+            Move-Item -Path $tmp -Destination $script:HistoryFile -Force
+        }
+    } catch {
+        Write-Log "Set-HistoryOffworkActual 失败: $($_.Exception.Message)"
     }
 }
 
@@ -278,6 +491,7 @@ function Start-DialogRunspace {
         $null = $ps.AddScript("function Write-State { $((Get-Command -Name 'Write-State').Definition) }")
         $null = $ps.AddScript("function Read-State { $((Get-Command -Name 'Read-State').Definition) }")
         $null = $ps.AddScript("function Add-HistoryLine { $((Get-Command -Name 'Add-HistoryLine').Definition) }")
+        $null = $ps.AddScript("function Set-HistoryOffworkActual { $((Get-Command -Name 'Set-HistoryOffworkActual').Definition) }")
         $null = $ps.AddScript("function Write-Log { $((Get-Command -Name 'Write-Log').Definition) }")
 
         $main = @'
@@ -326,6 +540,8 @@ try {
         if ($state -and $state.offwork_at -eq $ctx.ExpectedOffworkAt) {
             $state.offwork_notified = $true
             Write-State $state
+            # R10: 实际确认下班时间写入历史（统计准确性前提）
+            Set-HistoryOffworkActual -date $state.date -actual (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         }
     }
 } catch {
@@ -388,8 +604,9 @@ function Invoke-WorkReminder {
     Write-State $newState
 
     $now = Get-Date
+    $statLine = Get-StatsSummaryLine
     Start-DialogRunspace -Kind 'work' -Title '上班打卡提醒' `
-        -Message '记得飞书打卡上班！' `
+        -Message "记得飞书打卡上班！`n$statLine" `
         -SubMessage "填写实际打卡时间（$($script:WorkWindowStart):00 - $($script:WorkWindowEnd):00）" `
         -InputDefault $now.ToString('HH:mm')
 }
@@ -407,7 +624,22 @@ function Invoke-OffWorkCheck {
     $state.offwork_notified = $true
     Write-State $state
 
+    # R12: 下班确认弹窗附带 今日时长 + 本周工作日累计 + 50h 达标状态（附加信息，不改变强制确认语义）
     $msg = "上班 $($state.clockin_time) 打卡，已满 $script:OffWorkHours 小时，可以打下班卡了！"
+    $todayMin = Get-StateTodayMinutes $state
+    $wk = Get-WeekStats (Get-Date)
+    $statParts = New-Object System.Collections.ArrayList
+    if ($null -ne $todayMin) {
+        $null = $statParts.Add("今日时长 $(Format-Duration $todayMin)")
+    }
+    $null = $statParts.Add("本周工作日合计 $(Format-Duration $wk.Weekday)")
+    $statLine = $statParts -join ' ｜ '
+    if ($wk.Weekday -ge 3000) {
+        $statLine += ' ✅ 达标 (≥50h)'
+    } else {
+        $statLine += " ⚠️ 还差 $(Format-Duration (3000 - $wk.Weekday)) 达 50h"
+    }
+    $msg += "`n$statLine"
     Start-DialogRunspace -Kind 'offwork' -Title '下班打卡提醒' -Message $msg `
         -ExpectedOffworkAt $state.offwork_at
 }

@@ -1,12 +1,15 @@
 # Windows 打卡提醒小工具
 
-常驻后台的 PowerShell 脚本：**工作日 8 点提醒上班打卡（黄底红字、占屏 90%、必须点确认才关），填实际打卡时间后满 10 小时提醒下班打卡。周六/周日自动跳过，不提醒、不写记录。**
+常驻后台的 PowerShell 脚本：**工作日 8 点提醒上班打卡（黄底红字、占屏 90%、必须点确认才关），填实际打卡时间后满 10 小时提醒下班打卡。周六/周日自动跳过，不提醒、不写记录。** 下班确认后写入实际下班时间，可统计每日/每周/每月工作时长与 50h 达标情况；周末加班可用手动打卡单独记录。
 
 ## 文件
 
 | 文件 | 说明 |
 |:---|:---|
-| `clockin-reminder.ps1` | 常驻主脚本（解锁检测 + 强制确认弹窗，单文件） |
+| `clockin-reminder.ps1` | 常驻主脚本（解锁检测 + 强制确认弹窗 + 统计，单文件） |
+| `manual-clockin.ps1` | 手动打卡（周末/任意时间加班记录，普通窗口可关闭） |
+| `report.ps1` | 时长统计报告（命令行纯文本输出；`-Gui` 弹窗显示） |
+| `report-gui.bat` | **双击查看统计报告**（GUI 窗口，任意时间想看就看） |
 | `install.ps1` | 一键安装：拷脚本 + 注册开机自启 + 立即启动 |
 
 ## 部署（在 Windows 上）
@@ -18,15 +21,74 @@
    ```
 3. 完成。开机自启已注册（HKCU Run，无需管理员）。
 
-## 行为（v2）
+## 行为（v3）
 
 - **周末跳过**：周六/周日不弹任何提醒、不写历史记录
 - **8 点前**：脚本不轮询，睡到 8:00；8:00-12:00 之间主循环每 15 秒兜底检查，到点弹上班提醒（即使当天没解锁、没开机动作）
 - **12 点后启动**：当天不自动弹上班提醒（防止深夜重装/重启误弹）
 - **上班弹窗**：占屏 90%、刺眼黄底、红字，带输入框填实际打卡时间（8:00-10:00，超范围弹确认框，可 Yes 记录；Enter 键提交），必须点「确认已打卡」才关；Esc / Alt+F4 / 关闭按钮全部拦截
 - **下班提醒** = 实际打卡时间 + 10 小时，主循环每 15 秒检查，到点弹同样式弹窗，必须点「确认已下班」才关；周五漏确认的提醒，下次工作日开机补弹
+- **下班确认写库**：点「确认已下班」时，把实际确认时间写入 history.csv 的 `offwork_actual` 列；跨天（加班到次日）按完整时间相减，统计更准
+- **弹窗附带统计**：上班/下班弹窗 Message 里都附加统计——上班弹窗显示「本周工作日累计 + 50h 达标进度 + 本月累计」；下班弹窗显示「今日时长 + 本周工作日累计 + 50h 达标状态」。仅附加信息，确认动作不变
+- **统计口径**：每日时长 = `offwork_actual`（为空回退预计 `offwork_at`）− 上班打卡；周 = 周一~周日，工作日合计（周一~五）用于 50h 达标判断，周末加班单列；月 = 自然月全部记录
 - **弹窗不阻塞主循环**：弹窗在独立 runspace 线程运行，锁屏/人不在时挂起的弹窗不影响下班检查
 - 单实例互斥（双开自动退出）；state.json 原子写、解析失败跳过不崩脚本；主循环异常自动恢复（30 秒重试）
+
+## 手动打卡（加班记录，manual-clockin.ps1）
+
+周末或任意时间加班：双击 `manual-clockin.ps1`（或命令行 `powershell -NoProfile -ExecutionPolicy Bypass -File manual-clockin.ps1`）。
+
+- 弹窗选「记上班卡」或「记下班卡」，填时间（`HH:mm` / `H:mm`，默认当前时间），点「写入记录」
+- 当天该类型已有记录 → 弹「覆盖？」确认；Yes 更新该行，No 不动；没有则新增一行
+- 普通窗口、可关闭，不触发主脚本任何提醒；周末记录计入周/月统计的「周末加班」单列，不参与 50h 达标
+- 数据写入同一个 `history.csv`
+
+## 统计报告（report.ps1 / report-gui.bat）
+
+**任意时间想看打卡统计**，两种途径：
+
+- **双击 `report-gui.bat`** → 弹暗色只读窗口显示本周统计（最方便）
+- 命令行运行（纯文本输出到控制台）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1            # 本周（默认）
+powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Week
+powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Month
+powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -All
+powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Days 7
+powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹窗模式（同 bat）
+```
+
+示例输出：
+
+```
+本周 (2026-08-03 ~ 2026-08-09)
+  周一 08-03  09:12 -> 19:12  10h 00m
+  周二 08-04  09:00 -> 19:30  10h 30m
+  ...
+  工作日合计   50h 00m  ✅ 达标 (≥50h)
+  周末加班     0h 00m
+  本周总计     50h 00m
+本月 (2026-08) 工作日 50h 00m / 加班 0h 00m / 合计 50h 00m
+```
+
+- 无记录日期显示 `-`；只有上班卡没下班卡显示 `缺下班卡`
+- 解析失败/旧格式行跳过，末尾提示行号
+
+## 数据文件（history.csv 格式）
+
+`history.csv` 位于 `%USERPROFILE%\.clockin-reminder\`，表头 v3 为 4 列：
+
+```
+date,clockin_time,offwork_at,offwork_actual
+2026-08-03,09:12,2026-08-03 19:12,
+2026-08-03,09:12,2026-08-03 19:12,2026-08-03 19:05:30
+```
+
+- `date` 上班日期；`clockin_time` 上班打卡（`HH:mm`）
+- `offwork_at` **预计**下班时间（= 上班 + 10h，兼容旧数据）；`offwork_actual` **实际**确认下班时间
+- 统计时优先 `offwork_actual`，为空回退 `offwork_at`（预计值，精度略差）
+- 旧 3 列文件不强制迁移，读取按列数容错
 
 ## 验证
 
