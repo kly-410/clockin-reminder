@@ -7,7 +7,7 @@
 | 文件 | 说明 |
 |:---|:---|
 | `clockin-reminder.ps1` | 常驻主脚本（解锁检测 + 强制确认弹窗 + 统计，单文件） |
-| `manual-clockin.ps1` | 手动打卡 / 补录（周末加班记录，或补录过去某天上下班时间） |
+| `manual-clockin.ps1` / `manual-clockin.bat` | 手动打卡 / 补录（周末加班记录，或补录过去某天上下班时间；**双击 .bat 即开**，无需命令行） |
 | `report.ps1` | 时长统计报告 + **运行状态检查**（命令行纯文本输出；`-Gui` 弹窗显示） |
 | `report-gui.bat` | **双击查看运行状态 + 统计报告**（GUI 窗口，任意时间想看就看） |
 | `config-gui.ps1` / `config-gui.bat` | **随时修改默认配置**（config.json 图形界面，不必等弹窗） |
