@@ -1,11 +1,11 @@
 ﻿#Requires -Version 5.1
 <#
-  manual-clockin.ps1  —  手动打卡（周末/任意时间加班记录，v8）
+  manual-clockin.ps1  —  手动打卡 / 补录指定日期（周末加班记录 + 历史补录，v9）
   用法：
     双击运行，或命令行：
       powershell -NoProfile -ExecutionPolicy Bypass -File manual-clockin.ps1
   功能：
-    - 选「记上班卡」或「记下班卡」，填时间（HH:mm，默认当前时间），点按钮写入
+    - 选日期（默认今天，可改过去任意一天做补录）、选「记上班卡」或「记下班卡」，填时间（HH:mm），点按钮写入
     - 记下班卡取最晚（R16）：当天已有下班记录时，新时间更晚才确认更新；更早则提示跳过
     - 当天该类型已有记录时弹 YesNo 确认覆盖；没有则新增一行
     - 数据写入 log 周文件（log\<周一日期>.csv；日期,上班时间,预计下班,实际下班,工作时长；v8 起下班时间存完整 datetime，跨天加班到次日日期 +1）
@@ -235,7 +235,7 @@ function Set-ManualRecord {
 # ============ 手动打卡弹窗（普通窗口，可关闭）============
 function Show-ManualDialog {
     $w = 560
-    $h = 500
+    $h = 600
     $cx = [int]($w / 2)
 
     $form = New-Object System.Windows.Forms.Form
@@ -249,7 +249,7 @@ function Show-ManualDialog {
     $form.KeyPreview = $true
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = '手动打卡（加班记录）'
+    $title.Text = '手动打卡 / 补录'
     $title.Font = New-Object System.Drawing.Font('Microsoft YaHei', 22, [System.Drawing.FontStyle]::Bold)
     $title.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
     $title.BackColor = $form.BackColor
@@ -274,13 +274,28 @@ function Show-ManualDialog {
     $rbOffwork.SetBounds(($cx + 20), 120, 190, 56)
     $form.Controls.Add($rbOffwork)
 
+    $dateLabel = New-Object System.Windows.Forms.Label
+    $dateLabel.Text = '日期（默认今天，可补录过去）'
+    $dateLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei', 14)
+    $dateLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 200, 220)
+    $dateLabel.BackColor = $form.BackColor
+    $dateLabel.TextAlign = 'MiddleCenter'
+    $dateLabel.SetBounds(0, 160, $w, 32)
+    $form.Controls.Add($dateLabel)
+
+    $datePicker = New-Object System.Windows.Forms.DateTimePicker
+    $datePicker.Format = [System.Windows.Forms.DateTimePickerFormat]::Short
+    $datePicker.Font = New-Object System.Drawing.Font('Microsoft YaHei', 16)
+    $datePicker.SetBounds(($cx - 110), 195, 220, 44)
+    $form.Controls.Add($datePicker)
+
     $timeLabel = New-Object System.Windows.Forms.Label
     $timeLabel.Text = '打卡时间（HH:mm）'
     $timeLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei', 14)
     $timeLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 200, 220)
     $timeLabel.BackColor = $form.BackColor
     $timeLabel.TextAlign = 'MiddleCenter'
-    $timeLabel.SetBounds(0, 190, $w, 40)
+    $timeLabel.SetBounds(0, 245, $w, 40)
     $form.Controls.Add($timeLabel)
 
     $timeBox = New-Object System.Windows.Forms.TextBox
@@ -288,19 +303,19 @@ function Show-ManualDialog {
     $timeBox.Font = New-Object System.Drawing.Font('Microsoft YaHei', 22)
     $timeBox.ForeColor = [System.Drawing.Color]::Black
     $timeBox.TextAlign = 'Center'
-    $timeBox.SetBounds(($cx - 130), 240, 260, 52)
+    $timeBox.SetBounds(($cx - 130), 295, 260, 52)
     $form.Controls.Add($timeBox)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = '周末加班会单独统计，不计入 50h 达标'
+    $hint.Text = '补录过去日期会写入对应周文件；周末加班单列不计 50h 达标'
     $hint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 11)
     $hint.ForeColor = [System.Drawing.Color]::FromArgb(140, 160, 180)
     $hint.BackColor = $form.BackColor
     $hint.TextAlign = 'MiddleCenter'
-    $hint.SetBounds(0, 300, $w, 32)
+    $hint.SetBounds(0, 355, $w, 32)
     $form.Controls.Add($hint)
 
-    $form.Tag = @{ RbClockin = $rbClockin; RbOffwork = $rbOffwork; TimeBox = $timeBox; Result = $null }
+    $form.Tag = @{ RbClockin = $rbClockin; RbOffwork = $rbOffwork; DatePicker = $datePicker; TimeBox = $timeBox; Result = $null }
 
     $btn = New-Object System.Windows.Forms.Button
     $btn.Text = '写入记录'
@@ -321,7 +336,7 @@ function Show-ManualDialog {
             [System.Windows.Forms.MessageBox]::Show('时间格式不对，请填 HH:mm 或 H:mm，例如 08:30 或 8:30', '输入错误') | Out-Null
             return
         }
-        $today = (Get-Date).ToString('yyyy-MM-dd')
+        $today = $tag.DatePicker.Value.ToString('yyyy-MM-dd')
         $hhmm = $t.ToString('HH:mm')
 
         # 当天该类型已有记录 -> YesNo 覆盖确认；No 则不动
