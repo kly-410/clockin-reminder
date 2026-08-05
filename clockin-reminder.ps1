@@ -851,6 +851,7 @@ function Show-MandatoryDialog {
     )
     $curCfg = Read-Config
     $cfgNuds = @{}
+    $cfgLbls = @{}
     $rowY = $editTop + 6
     foreach ($r in $cfgRows) {
         $lbl = New-Object System.Windows.Forms.Label
@@ -861,6 +862,7 @@ function Show-MandatoryDialog {
         $lbl.SetBounds(23, ($rowY + 4), 118, 22)
         $lbl.Visible = $false
         $form.Controls.Add($lbl)
+        $cfgLbls[$r.Name] = $lbl
 
         $nud = New-Object System.Windows.Forms.NumericUpDown
         $nud.Minimum = $r.Min
@@ -906,6 +908,7 @@ function Show-MandatoryDialog {
     $form.Tag.CfgSummary   = $cfgSummary
     $form.Tag.CfgUnlockBtn = $btnUnlock
     $form.Tag.CfgNuds      = $cfgNuds
+    $form.Tag.CfgLbls      = $cfgLbls
     $form.Tag.CfgChk       = $cfgChk
     $form.Tag.CfgSaveBtn   = $btnSave
     $form.Tag.CfgCancelBtn = $btnCancel
@@ -917,6 +920,7 @@ function Show-MandatoryDialog {
         $tag = $f.Tag
         $tag.CfgUnlocked = $true
         $tag.CfgStrip.Visible = $false
+        foreach ($l in $tag.CfgLbls.Values) { $l.Visible = $true }
         foreach ($n in $tag.CfgNuds.Values) { $n.Visible = $true }
         $tag.CfgChk.Visible = $true
         $tag.CfgSaveBtn.Visible = $true
@@ -934,6 +938,7 @@ function Show-MandatoryDialog {
         $tag.CfgSummary.Text = '配置 · ' + (Get-ConfigSummary $new)
         $tag.CfgUnlocked = $false
         $tag.CfgStrip.Visible = $true
+        foreach ($l in $tag.CfgLbls.Values) { $l.Visible = $false }
         foreach ($n in $tag.CfgNuds.Values) { $n.Visible = $false }
         $tag.CfgChk.Visible = $false
         $tag.CfgSaveBtn.Visible = $false
@@ -946,6 +951,7 @@ function Show-MandatoryDialog {
         $tag = $f.Tag
         $tag.CfgUnlocked = $false
         $tag.CfgStrip.Visible = $true
+        foreach ($l in $tag.CfgLbls.Values) { $l.Visible = $false }
         foreach ($n in $tag.CfgNuds.Values) { $n.Visible = $false }
         $tag.CfgChk.Visible = $false
         $tag.CfgSaveBtn.Visible = $false
