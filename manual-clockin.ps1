@@ -235,7 +235,7 @@ function Set-ManualRecord {
 # ============ 手动打卡弹窗（普通窗口，可关闭）============
 function Show-ManualDialog {
     $w = 560
-    $h = 600
+    $h = 470
     $cx = [int]($w / 2)
 
     $form = New-Object System.Windows.Forms.Form
@@ -254,7 +254,7 @@ function Show-ManualDialog {
     $title.ForeColor = [System.Drawing.Color]::FromArgb(255, 220, 80)
     $title.BackColor = $form.BackColor
     $title.TextAlign = 'MiddleCenter'
-    $title.SetBounds(0, 24, $w, 56)
+    $title.SetBounds(0, 14, $w, 48)
     $form.Controls.Add($title)
 
     $rbClockin = New-Object System.Windows.Forms.RadioButton
@@ -263,7 +263,7 @@ function Show-ManualDialog {
     $rbClockin.ForeColor = [System.Drawing.Color]::White
     $rbClockin.BackColor = $form.BackColor
     $rbClockin.Checked = $true
-    $rbClockin.SetBounds(($cx - 210), 120, 190, 56)
+    $rbClockin.SetBounds(($cx - 210), 84, 190, 50)
     $form.Controls.Add($rbClockin)
 
     $rbOffwork = New-Object System.Windows.Forms.RadioButton
@@ -271,7 +271,7 @@ function Show-ManualDialog {
     $rbOffwork.Font = New-Object System.Drawing.Font('Microsoft YaHei', 18)
     $rbOffwork.ForeColor = [System.Drawing.Color]::White
     $rbOffwork.BackColor = $form.BackColor
-    $rbOffwork.SetBounds(($cx + 20), 120, 190, 56)
+    $rbOffwork.SetBounds(($cx + 20), 84, 190, 50)
     $form.Controls.Add($rbOffwork)
 
     $dateLabel = New-Object System.Windows.Forms.Label
@@ -280,13 +280,13 @@ function Show-ManualDialog {
     $dateLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 200, 220)
     $dateLabel.BackColor = $form.BackColor
     $dateLabel.TextAlign = 'MiddleCenter'
-    $dateLabel.SetBounds(0, 160, $w, 32)
+    $dateLabel.SetBounds(0, 146, $w, 28)
     $form.Controls.Add($dateLabel)
 
     $datePicker = New-Object System.Windows.Forms.DateTimePicker
     $datePicker.Format = [System.Windows.Forms.DateTimePickerFormat]::Short
     $datePicker.Font = New-Object System.Drawing.Font('Microsoft YaHei', 16)
-    $datePicker.SetBounds(($cx - 110), 195, 220, 44)
+    $datePicker.SetBounds(($cx - 110), 178, 220, 40)
     $form.Controls.Add($datePicker)
 
     $timeLabel = New-Object System.Windows.Forms.Label
@@ -295,7 +295,7 @@ function Show-ManualDialog {
     $timeLabel.ForeColor = [System.Drawing.Color]::FromArgb(180, 200, 220)
     $timeLabel.BackColor = $form.BackColor
     $timeLabel.TextAlign = 'MiddleCenter'
-    $timeLabel.SetBounds(0, 245, $w, 40)
+    $timeLabel.SetBounds(0, 226, $w, 28)
     $form.Controls.Add($timeLabel)
 
     $timeBox = New-Object System.Windows.Forms.TextBox
@@ -303,16 +303,16 @@ function Show-ManualDialog {
     $timeBox.Font = New-Object System.Drawing.Font('Microsoft YaHei', 22)
     $timeBox.ForeColor = [System.Drawing.Color]::Black
     $timeBox.TextAlign = 'Center'
-    $timeBox.SetBounds(($cx - 130), 295, 260, 52)
+    $timeBox.SetBounds(($cx - 130), 258, 260, 50)
     $form.Controls.Add($timeBox)
 
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = '补录过去日期会写入对应周文件；周末加班单列不计 50h 达标'
+    $hint.Text = "写入成功不关闭，可连续补录/修改多天；点「退出」或右上角 X 关闭`n补录过去日期写入对应周文件；周末加班单列不计 50h 达标"
     $hint.Font = New-Object System.Drawing.Font('Microsoft YaHei', 11)
     $hint.ForeColor = [System.Drawing.Color]::FromArgb(140, 160, 180)
     $hint.BackColor = $form.BackColor
     $hint.TextAlign = 'MiddleCenter'
-    $hint.SetBounds(0, 355, $w, 32)
+    $hint.SetBounds(0, 316, $w, 46)
     $form.Controls.Add($hint)
 
     $form.Tag = @{ RbClockin = $rbClockin; RbOffwork = $rbOffwork; DatePicker = $datePicker; TimeBox = $timeBox; Result = $null }
@@ -323,7 +323,7 @@ function Show-ManualDialog {
     $btn.ForeColor = [System.Drawing.Color]::White
     $btn.BackColor = [System.Drawing.Color]::FromArgb(200, 60, 40)
     $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $btn.SetBounds(($cx - 130), 360, 260, 70)
+    $btn.SetBounds(($cx - 230), 372, 210, 56)
     $btn.Add_Click({
         param($sender, $e)
         $f = $sender.FindForm()
@@ -384,12 +384,26 @@ function Show-ManualDialog {
         }
         if (Set-ManualRecord -date $today -kind $kind -timeValue $value) {
             $kindName = if ($kind -eq 'clockin') { '上班' } else { '下班' }
-            [System.Windows.Forms.MessageBox]::Show("已记录：$today $kindName卡 $hhmm", '成功') | Out-Null
+            # v10: 写入成功后不关闭窗口——支持连续补录/修改多天；点「退出」按钮或右上角 X 关闭
+            [System.Windows.Forms.MessageBox]::Show("已记录：$today $kindName卡 $hhmm`n可继续补录/修改其他日期，点「退出」或右上角 X 关闭", '成功') | Out-Null
             $tag.Result = $true
-            $f.Close()
         }
     })
     $form.Controls.Add($btn)
+
+    $btnExit = New-Object System.Windows.Forms.Button
+    $btnExit.Text = '退出'
+    $btnExit.Font = New-Object System.Drawing.Font('Microsoft YaHei', 16, [System.Drawing.FontStyle]::Bold)
+    $btnExit.ForeColor = [System.Drawing.Color]::White
+    $btnExit.BackColor = [System.Drawing.Color]::FromArgb(90, 100, 120)
+    $btnExit.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnExit.SetBounds(($cx + 20), 372, 210, 56)
+    $btnExit.Add_Click({
+        param($sender, $e)
+        $sender.FindForm().Close()
+    })
+    $form.Controls.Add($btnExit)
+    $form.CancelButton = $btnExit   # Esc 键关闭
     $form.AcceptButton = $btn   # Enter 键写入
 
     $null = $form.ShowDialog()
