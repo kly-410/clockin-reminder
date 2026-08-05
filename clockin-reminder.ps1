@@ -762,6 +762,37 @@ function Show-MandatoryDialog {
     $form.KeyPreview = $true
     $form.Tag = @{ Result = $null; Input = $null; Skipped = $false; WithInput = $WithInput; WorkStart = $WorkStart; WorkEnd = $WorkEnd; OffworkMode = $OffworkMode }
 
+    # v12: 强制置顶防遮挡——普通 TopMost 遇到其他置顶窗口/全屏应用仍可能被盖住。
+    # Shown 时激活到前台 + BringToFront + SetWindowPos(HWND_TOPMOST) 压到 Z 序最顶。
+    # Add-Type 放函数体内（守卫防重复编译）：runspace 注入的是整个函数 Definition，注入线程也能编译使用。
+    if (-not ('User32Top' -as [type])) {
+        try {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class User32Top {
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+}
+'@
+        } catch {
+            try { Write-Log "User32Top Add-Type 失败: $($_.Exception.Message)" } catch { }
+        }
+    }
+    $form.Add_Shown({
+        param($sender, $e)
+        try {
+            $f = $sender
+            $f.Activate()          # 激活窗口到前台
+            $f.BringToFront()      # 前端显示
+            $f.TopMost = $true     # 刷新置顶
+            # HWND_TOPMOST = -1；SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW = 0x0001|0x0002|0x0040 → 0x0043
+            if ('User32Top' -as [type]) {
+                [User32Top]::SetWindowPos($f.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x0043) | Out-Null
+            }
+        } catch { }
+    })
+
     # 拦截 Esc
     $form.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $_.SuppressKeyPress = $true } })
     # 拦截 Alt+F4 / 一切关闭：未确认且未点后门按钮前禁止关窗
