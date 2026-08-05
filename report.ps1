@@ -7,6 +7,9 @@
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Month
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -All
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Days 7
+    powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui          # GUI 窗口
+    powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui -Save   # GUI + 存 report-日期.csv
+    powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Help         # 显示本帮助
   说明：
     - 数据来自脚本同目录（log 周文件 + history.csv 兼容；R31）
     - 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5 HH:mm / v8 完整 datetime）；offwork_actual 为空时回退 offwork_at（预计值）
@@ -21,9 +24,19 @@ param(
     [switch]$All,
     [int]$Days = 0,
     [switch]$Gui,
-    [switch]$Save
+    [switch]$Save,
+    [switch]$Help
 )
 $ErrorActionPreference = 'Stop'
+
+# -Help：打印文件头部说明块（<# ... #>）后退出（不读数据、不弹窗）
+if ($Help) {
+    $raw = Get-Content -LiteralPath $PSCommandPath -Raw -Encoding UTF8
+    if ($raw -match '(?s)<#(.*?)#>') {
+        $matches[1] -split "`r?`n" | ForEach-Object { $_ -replace '^\s+', '' } | Where-Object { $_ -ne '' }
+    }
+    exit 0
+}
 
 $script:DataDir      = $PSScriptRoot
 $script:HistoryFile  = Join-Path $script:DataDir 'history.csv'          # 旧单文件（兼容，若存在也合并读）
