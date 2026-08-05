@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$script:DataDir      = Join-Path $env:USERPROFILE '.clockin-reminder'
+$script:DataDir      = $PSScriptRoot
 $script:HistoryFile  = Join-Path $script:DataDir 'history.csv'   # R28: 旧版单一文件，仅迁移兼容读取
 $script:LogDir       = Join-Path $script:DataDir 'log'           # R28: 历史记录按周归档 log\<周一日期>.csv
 $script:SkippedLines = New-Object System.Collections.ArrayList

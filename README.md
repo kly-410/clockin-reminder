@@ -87,10 +87,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹�
 
 ## 数据文件（log 周文件）
 
-数据位于 `%USERPROFILE%\.clockin-reminder\`，v8 起历史记录**按周归档**：
+数据与脚本**同目录**（R31，就地安装，不再用 `%USERPROFILE%\.clockin-reminder\`），v8 起历史记录**按周归档**：
 
 ```
-%USERPROFILE%\.clockin-reminder\
+<脚本所在目录>\
   config.json              配置
   state.json               状态（date / clockin_time / offwork_at / next_remind_at …）
   log\2026-08-03.csv       本周记录（文件名 = 该周周一的日期）
@@ -123,11 +123,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹�
 ## 验证
 
 1. 按 `Win+L` 锁屏再解锁（工作日 8-12 点）→ 应弹出上班提醒
-2. 查看记录：
+2. 查看记录（脚本同目录）：
    ```powershell
-   Get-Content "$env:USERPROFILE\.clockin-reminder\state.json"
-   Get-Content "$env:USERPROFILE\.clockin-reminder\log\*.csv"      # 按周归档的历史记录
-   Get-Content "$env:USERPROFILE\.clockin-reminder\log.txt"        # 异常日志
+   Get-Content ".\state.json"
+   Get-Content ".\log\*.csv"      # 按周归档的历史记录
+   Get-Content ".\log.txt"        # 异常日志
    ```
 3. 快速验证：把主脚本里 `$script:WorkWindowStart = 8` 改成 `0`、`$script:OffWorkHours = 10` 改成 `0.05`（3 分钟），
    重跑 `install.ps1` → 立即弹上班提醒，填时间后 3 分钟弹下班提醒。验完改回。
@@ -148,7 +148,7 @@ v8 起历史记录**本身就按周归档**：每天记录写入当天所在周�
 
 ## 卸载
 
-双击或命令行运行 `uninstall.ps1`（停进程 + 删自启 + 删数据目录含 `log` 子文件夹，删数据前会确认）：
+双击或命令行运行 `uninstall.ps1`（停进程 + 删自启 + 删数据文件含 `log` 子文件夹，删数据前会确认；R31 起只删数据文件、保留脚本本身）：
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File uninstall.ps1
 ```
@@ -163,8 +163,9 @@ Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.e
 # 2. 删开机自启项
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'ClockinReminder'
 
-# 3. 删数据目录
-Remove-Item "$env:USERPROFILE\.clockin-reminder" -Recurse -Force
+# 3. 删数据文件（脚本同目录）
+Remove-Item ".\log" -Recurse -Force
+Remove-Item ".\log.txt", ".\history.csv", ".\state.json", ".\config.json" -Force
 ```
 
 ## 说明

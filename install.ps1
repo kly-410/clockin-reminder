@@ -4,10 +4,10 @@
   或右键「使用 PowerShell 运行」。
   作用：
     0. 弹配置表单（可改配置，确定后写 config.json）
-    1. 拷贝 clockin-reminder.ps1、manual-clockin.ps1 到 %USERPROFILE%\.clockin-reminder\
+    1. 就地安装（R31）：脚本留在当前目录，数据也写当前目录（不再拷贝到 %USERPROFILE%）
     2. 注册开机自启（HKCU Run，无需管理员）
     3. 立即启动常驻脚本
-  说明：report.ps1 不用安装，拷到任意目录命令行运行即可（数据读 %USERPROFILE%\.clockin-reminder\）
+  说明：report.ps1 不用安装，与主脚本同目录运行即可（数据读脚本同目录）
   R22：安装前先弹 WinForms 配置表单；预填已存在的 config.json（重装时保留当前配置）
   R30：启动新实例后轮询 3 秒确认进程存活（旧 Mutex 未释放导致新实例退出的问题）
 #>
@@ -17,7 +17,7 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $srcDir    = $PSScriptRoot
-$dstDir    = Join-Path $env:USERPROFILE '.clockin-reminder'
+$dstDir    = $PSScriptRoot   # R31: 就地安装——数据与代码同目录，方便查找（不再拷到 %USERPROFILE%）
 $scriptPath = Join-Path $dstDir 'clockin-reminder.ps1'
 $configFile = Join-Path $dstDir 'config.json'
 
@@ -233,10 +233,8 @@ if ($null -ne $cfgResult) {
     Write-Host '[提示] 已取消，使用默认配置（首次运行主脚本会自动创建 config.json）' -ForegroundColor Yellow
 }
 
-# 1. 拷贝主脚本 + 手动打卡脚本
+# 1. 就地安装（R31）：脚本已在本目录，无需拷贝；确保目录存在即可
 if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
-Copy-Item (Join-Path $srcDir 'clockin-reminder.ps1') $scriptPath -Force
-Copy-Item (Join-Path $srcDir 'manual-clockin.ps1') (Join-Path $dstDir 'manual-clockin.ps1') -Force
 
 # 2. 注册开机自启（HKCU Run，无需管理员）
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'

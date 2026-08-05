@@ -11,7 +11,7 @@
     7. offwork_actual 同一天多次确认取最晚（R16）
     8. 全天缺勤补记：工作日 20 点后无记录补 0h 0min；启动时补前一天 0h 0min（R19）
     9. 配置持久化到 config.json；弹窗底部配置区先解锁才能改，保存后下次轮询生效（R21/R23）
-  数据文件：%USERPROFILE%\.clockin-reminder\
+  数据文件：脚本同目录（R31，不再用 %USERPROFILE%\.clockin-reminder\）
     state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
     log\<周一日期>.csv  历史记录按周归档，每周一个文件（日期,上班时间,预计下班,实际下班,工作时长；v8 起 offwork 时间存完整 datetime，可能次日）
     log.txt      异常日志
@@ -34,7 +34,7 @@ $script:DefaultConfig = @{
     ReRemindIntervalMinutes  = 30            # 满 10h 后默认每 30 分钟再弹一次（R15）
     MaxRemindHour            = 23            # 超过该小时不再自动提醒下班（防深夜骚扰；可手动记）（R15）
 }
-$script:DataDir     = Join-Path $env:USERPROFILE '.clockin-reminder'
+$script:DataDir     = $PSScriptRoot
 $script:ConfigFile  = Join-Path $script:DataDir 'config.json'
 $script:StateFile   = Join-Path $script:DataDir 'state.json'
 $script:HistoryFile = Join-Path $script:DataDir 'history.csv'   # R28: 旧版单一文件，仅迁移兼容读取

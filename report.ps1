@@ -8,7 +8,7 @@
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -All
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Days 7
   说明：
-    - 数据来自 %USERPROFILE%\.clockin-reminder\history.csv
+    - 数据来自脚本同目录（log 周文件 + history.csv 兼容；R31）
     - 兼容 3 列（旧）/4 列（v3/v4）/5 列（v5 HH:mm / v8 完整 datetime）；offwork_actual 为空时回退 offwork_at（预计值）
     - v8: offwork 时间存完整 datetime（含日期，下班可能次日）；旧 HH:mm 行走跨天推断 fallback（与主脚本 Get-RecordEnd 一致）
     - v6: 请假/全天缺勤行（上班/下班都空）显示 0h 0min (请假)，计入工作日占位（不拉高不拉低）
@@ -25,7 +25,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$script:DataDir      = Join-Path $env:USERPROFILE '.clockin-reminder'
+$script:DataDir      = $PSScriptRoot
 $script:HistoryFile  = Join-Path $script:DataDir 'history.csv'          # 旧单文件（兼容，若存在也合并读）
 $script:LogDir       = Join-Path $script:DataDir 'log'                  # v8: 周文件目录
 $script:SkippedLines = New-Object System.Collections.ArrayList
@@ -273,7 +273,7 @@ function Show-DaysReport {
 }
 
 # ============ 每周 CSV 导出（log 文件夹，每周期一个文件）============
-# 生成 %USERPROFILE%\.clockin-reminder\log\week-<年-W周>.csv
+# 生成 脚本同目录\log\week-<年-W周>.csv
 # 内容：本周每天的明细（CSV 行）+ 周统计 + 本月累计统计（满足"包含该月已有数据"）
 function Export-WeeklyCsv {
     param([datetime]$d = (Get-Date))
