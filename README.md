@@ -44,9 +44,9 @@ v8 起，install 杀旧实例后、启动新实例前，会等待旧实例的单
 - **弹窗不阻塞主循环**：弹窗在独立 runspace 线程运行，锁屏/人不在时挂起的弹窗不影响下班检查
 - 单实例互斥（双开自动退出）；state.json 原子写、解析失败跳过不崩脚本；主循环异常自动恢复（30 秒重试）
 
-## 手动打卡 / 补录（manual-clockin.ps1）
+## 手动打卡 / 补录（manual-clockin.bat）
 
-周末加班、或**补录过去某一天的上下班时间**：双击 `manual-clockin.ps1`（或命令行 `powershell -NoProfile -ExecutionPolicy Bypass -File manual-clockin.ps1`）。
+周末加班、或**补录过去某一天的上下班时间**：双击 `manual-clockin.bat`（或命令行 `powershell -NoProfile -ExecutionPolicy Bypass -File manual-clockin.ps1`）。
 
 - 弹窗**选日期**（默认今天；改到过去任意一天即补录，比如周一周二已过去、周三才用上工具，就选周一/周二补录）、选「记上班卡」或「记下班卡」，填时间（`HH:mm` / `H:mm`，默认当前时间），点「写入记录」
 - 补录写入**对应周的 log 周文件**（`log\<周一日期>.csv`，v9），周/月统计自动纳入
