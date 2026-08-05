@@ -135,6 +135,9 @@ function Get-RunStatus {
         $null = $lines.Add('   今日: 无 state.json（今天尚未解锁/打卡）')
     }
 
+    # 3.5) 预期下次弹窗提醒时间（R40）
+    $null = $lines.Add(('   下次弹窗: ' + (Get-NextPopupText)))
+
     # 4) 最近日志错误计数（log.txt 中 ERROR/失败/异常）
     $errCount = 0
     if (Test-Path $script:LogFile) {
@@ -164,6 +167,91 @@ function Get-RunStatus {
     }
 
     return $lines
+}
+
+# ============ 预期下次弹窗提醒时间（R40：与主脚本状态机一致）============
+# 判定顺序（与 clockin-reminder.ps1 主循环 2 分钟轮询逻辑一致）：
+#   1) 周末跳过（SkipWeekend）
+#   2) 今天无状态（date != today）→ 上班提醒：未到窗口 / 窗口内即将弹 / 窗口已过
+#   3) 上班已弹未打卡 → 等待输入
+#   4) 已打卡 → 下班提醒：基准 = next_remind_at（循环）?: offwork_at（首次）
+#      now < 基准 → 显示基准时间；now >= 基准 且未达最晚 → 即将弹出（≤2 分钟）
+function Get-NextPopupText {
+    $now = Get-Date
+    $today = $now.ToString('yyyy-MM-dd')
+
+    # 配置（读失败用主脚本默认值）
+    $cfg = $null
+    if (Test-Path $script:ConfigFile) {
+        try { $cfg = Get-Content -Path $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $cfg = $null }
+    }
+    $ws   = if ($cfg -and $null -ne $cfg.WorkWindowStart)   { [int]$cfg.WorkWindowStart }   else { 8 }
+    $we   = if ($cfg -and $null -ne $cfg.WorkAutoPopupEnd)  { [int]$cfg.WorkAutoPopupEnd }  else { 12 }
+    $maxH = if ($cfg -and $null -ne $cfg.MaxRemindHour)     { [int]$cfg.MaxRemindHour }     else { 23 }
+    $skip = if ($cfg -and $null -ne $cfg.SkipWeekend)       { [bool]$cfg.SkipWeekend }      else { $true }
+
+    # 1) 周末守卫
+    if ($skip) {
+        $dow = $now.DayOfWeek
+        if ($dow -eq [DayOfWeek]::Saturday -or $dow -eq [DayOfWeek]::Sunday) { return '今天无提醒（周末跳过）' }
+    }
+
+    $st = $null
+    if (Test-Path $script:StateFile) {
+        try { $st = Get-Content -Path $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $st = $null }
+    }
+
+    # 2) 今天还没有任何状态（date != today）
+    if ($null -eq $st -or ([string]$st.date) -ne $today) {
+        if ($now.Hour -lt $ws) { return ('上班提醒：今天 {0:00}:00' -f $ws) }
+        if ($now.Hour -lt $we) { return '上班提醒：即将弹出（下一次轮询，≤2 分钟）' }
+        if ($now.Hour -lt 23)  { return '上班提醒：自动窗口已过（解锁/启动时触发，23 点前）' }
+        return '今天无提醒（已过 23 点）'
+    }
+
+    # 3) 上班提醒状态
+    $shown = $false
+    if ($null -ne $st.PSObject.Properties['work_reminder_shown']) { $shown = [bool]$st.work_reminder_shown }
+    $ckin = [string]$st.clockin_time
+    $isClocked = -not [string]::IsNullOrWhiteSpace($ckin)
+    if ($shown -and -not $isClocked) {
+        return '上班弹窗已弹出，等待输入打卡时间'
+    }
+    if (-not $shown -and -not $isClocked) {
+        if ($now.Hour -lt $ws) { return ('上班提醒：今天 {0:00}:00' -f $ws) }
+        if ($now.Hour -lt $we) { return '上班提醒：即将弹出（下一次轮询，≤2 分钟）' }
+        return '上班提醒：自动窗口已过（解锁/启动时触发）'
+    }
+
+    # 4) 已打卡 → 下班提醒
+    $notified = $false
+    if ($null -ne $st.PSObject.Properties['offwork_notified']) { $notified = [bool]$st.offwork_notified }
+    if ($notified) {
+        $nra = [string]$st.next_remind_at
+        if ([string]::IsNullOrWhiteSpace($nra)) { return '今日提醒已结束（下班已确认）' }
+    }
+
+    # 基准 = next_remind_at（循环）?: offwork_at（首次）
+    $isRepeat = -not [string]::IsNullOrWhiteSpace([string]$st.next_remind_at)
+    $baseRaw = if ($isRepeat) { [string]$st.next_remind_at } else { [string]$st.offwork_at }
+    if ([string]::IsNullOrWhiteSpace($baseRaw)) { return '下班提醒：待定（无基准时间）' }
+    $target = $null
+    try {
+        $target = [datetime]::ParseExact($baseRaw, 'yyyy-MM-dd HH:mm:ss', $null)
+    } catch {
+        return '下班提醒：时间无法解析'
+    }
+
+    if ($now -lt $target) {
+        # 循环提醒跨天（next_remind_at 已到次日）：主脚本跨天保护不弹，直接预告无提醒
+        if ($isRepeat -and $target.Date -ne $now.Date) { return '今日无下班提醒（循环提醒仅限当天）' }
+        if ($target.Date -eq $now.Date) { return ('下班提醒：今天 {0:HH:mm}' -f $target) }
+        return ('下班提醒：{0:yyyy-MM-dd HH:mm}' -f $target)
+    }
+    # now >= target
+    if ($isRepeat -and $target.Date -ne $now.Date) { return '今日无下班提醒（循环提醒仅限当天）' }
+    if ($now.Hour -ge $maxH) { return '今日无下班提醒（已过最晚提醒时间）' }
+    return '下班提醒：即将弹出（下一次轮询，≤2 分钟）'
 }
 
 # ============ 历史读取与解析（与主脚本一致：log 周文件 + 旧 history.csv 合并；R28）============

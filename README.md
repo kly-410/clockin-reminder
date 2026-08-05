@@ -23,7 +23,7 @@
 
 | 想做什么 | 操作 |
 |:---|:---|
-| 查看统计 / 确认程序在跑 | 双击 `report-gui.bat` |
+| 查看统计 / 确认程序在跑 | 双击 `report-gui.bat`（含运行状态 + 预期下次弹窗时间） |
 | 补录某天打卡 / 记周末加班 | 双击 `manual-clockin.bat` |
 | 修改提醒时间等配置 | 双击 `config-gui.bat` |
 | 卸载 | 双击 `uninstall.bat` |
