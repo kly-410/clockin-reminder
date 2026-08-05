@@ -8,8 +8,10 @@
 |:---|:---|
 | `clockin-reminder.ps1` | 常驻主脚本（解锁检测 + 强制确认弹窗 + 统计，单文件） |
 | `manual-clockin.ps1` | 手动打卡（周末/任意时间加班记录，普通窗口可关闭） |
-| `report.ps1` | 时长统计报告（命令行纯文本输出；`-Gui` 弹窗显示） |
-| `report-gui.bat` | **双击查看统计报告**（GUI 窗口，任意时间想看就看） |
+| `report.ps1` | 时长统计报告 + **运行状态检查**（命令行纯文本输出；`-Gui` 弹窗显示） |
+| `report-gui.bat` | **双击查看运行状态 + 统计报告**（GUI 窗口，任意时间想看就看） |
+| `status.ps1` | 运行状态查询（进程 + 心跳 + 数据完整性；文本模式 / `-Gui` 弹窗） |
+| `status-check.bat` | **双击查看程序运行状态**（GUI 窗口） |
 | `install.ps1` | 一键安装：拷脚本 + 注册开机自启 + 立即启动 |
 | `uninstall.ps1` | 一键卸载：停进程 + 删自启 + 删数据 |
 
@@ -52,11 +54,11 @@ v8 起，install 杀旧实例后、启动新实例前，会等待旧实例的单
 - 普通窗口、可关闭，不触发主脚本任何提醒；周末记录计入周/月统计的「周末加班」单列，不参与 50h 达标
 - 数据写入对应周的 log 周文件（`log\<周一日期>.csv`，v8）；当天该类型已有记录时按取最晚逻辑处理（下班卡）
 
-## 统计报告（report.ps1 / report-gui.bat）
+## 统计报告 + 运行状态（report.ps1 / report-gui.bat）
 
-**任意时间想看打卡统计**，两种途径：
+**任意时间想看打卡统计 / 确认常驻程序是否在正常运行**，两种途径：
 
-- **双击 `report-gui.bat`** → 弹暗色只读窗口显示本周统计（最方便）
+- **双击 `report-gui.bat`** → 弹暗色只读窗口，**顶部显示运行状态**（主程序是否在跑、心跳时间、今日状态、日志异常数、配置摘要），下方是本周统计（最方便，状态 + 报告一次看完）
 - 命令行运行（纯文本输出到控制台）：
 
 ```powershell
@@ -68,9 +70,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Days 7
 powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹窗模式（同 bat）
 ```
 
+运行状态判定（R32）：
+
+- 主程序每 2 分钟把心跳时间写入 `state.json` 的 `last_heartbeat_at`；心跳 ≤10 分钟前更新 → `✅ 主程序运行中`；缺失/过期 → `❌ 主程序未运行`
+- 辅助显示：进程实例数（按命令行匹配 `clockin-reminder.ps1`）、今日打卡状态（state.json）、log.txt 累计异常条数、当前配置摘要
+
 示例输出：
 
 ```
+==================== 运行状态 ====================
+✅ 主程序运行中
+   心跳: 2026-08-05 16:30:00（1 分钟前）
+   进程: 找到 1 个实例（PID 12345）
+   今日 2026-08-05: 上班 09:12 · 下班提醒 已触发
+   日志: log.txt 共 2 条异常记录
+   配置: 满 10h 提醒下班 · 上班窗 8-12点 · 循环 30min · 23点截止 · 周末跳过
+
+==================== 打卡统计 ====================
 本周 (2026-08-03 ~ 2026-08-09)
   周一 08-03  09:12 -> 19:12  10h 00m
   周二 08-04  09:00 -> 19:30  10h 30m
@@ -92,7 +108,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹�
 ```
 <脚本所在目录>\
   config.json              配置
-  state.json               状态（date / clockin_time / offwork_at / next_remind_at …）
+  state.json               状态（date / clockin_time / offwork_at / next_remind_at / last_heartbeat_at 心跳，R32）
   log\2026-08-03.csv       本周记录（文件名 = 该周周一的日期）
   log\2026-08-10.csv       上周记录
   ...

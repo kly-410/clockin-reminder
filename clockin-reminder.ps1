@@ -158,6 +158,18 @@ function Write-Log {
     } catch { }
 }
 
+# ============ 心跳（R32：status.ps1 / report.ps1 据此判断主程序是否在运行）============
+# 主循环每轮（2 分钟）往 state.json 写 last_heartbeat_at 字段：
+# 存在且 ≤10 分钟内更新 = 运行正常；缺失/过期 = 未运行 / 主循环卡死。
+# 只加一个字段，不改任何现有字段语义；复用 Read-State/Write-State/Invoke-DataLocked，不新造锁。
+# 写入失败不致命（Write-State 内部已吞错），下一轮照跳。
+function Write-Heartbeat {
+    $state = Read-State
+    if ($null -eq $state) { $state = @{} }
+    $state.last_heartbeat_at = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    Write-State $state
+}
+
 # ============ 数据 ============
 function Ensure-DataDir {
     if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
@@ -1254,6 +1266,7 @@ try {
 
 # ============ 启动 ============
 Ensure-DataDir
+Write-Heartbeat                                     # R32: 启动即写心跳（不用等第一轮循环）
 # R21: 启动读 config.json；不存在则用默认值并写出（自动创建）
 if (-not (Test-Path $script:ConfigFile)) { Write-Config $script:DefaultConfig }
 Reload-Config
@@ -1273,6 +1286,7 @@ $prevLocked = Test-Locked
 while ($true) {
     try {
         Start-Sleep -Seconds 120
+        Write-Heartbeat                   # R32: 每轮写 state.json 心跳，report.ps1 据此判断运行状态
         Invoke-OffWorkCheck
         Invoke-AbsenceCheck              # R19: 工作日 20 点后无记录补 0h 0min（去重）
         Invoke-WorkReminder              # R3 每天 8 点兜底（不依赖启动/解锁事件；跨天常驻第二天 8 点也能弹）

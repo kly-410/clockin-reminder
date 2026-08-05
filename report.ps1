@@ -41,11 +41,116 @@ if ($Help) {
 $script:DataDir      = $PSScriptRoot
 $script:HistoryFile  = Join-Path $script:DataDir 'history.csv'          # 旧单文件（兼容，若存在也合并读）
 $script:LogDir       = Join-Path $script:DataDir 'log'                  # v8: 周文件目录
+$script:StateFile    = Join-Path $script:DataDir 'state.json'           # R32: 运行状态检查用
+$script:ConfigFile   = Join-Path $script:DataDir 'config.json'          # R32: 运行状态检查用
+$script:LogFile      = Join-Path $script:DataDir 'log.txt'              # R32: 运行状态检查用
 $script:SkippedLines = New-Object System.Collections.ArrayList
 
-# ============ 历史读取与解析（与主脚本一致）============
-function Read-HistoryRows {
-    param([string]$Path = $script:HistoryFile)
+# ============ 运行状态检查（R32：双击 report-gui.bat 即可查看主程序是否正常运行）============
+# 判定逻辑（与 status.ps1 一致，心跳源 = state.json last_heartbeat_at）：
+#   - state.json 的 last_heartbeat_at ≤10 分钟前更新 → 运行中（主脚本每 2 分钟写一次）
+#   - 心跳缺失或过期 → 未运行 / 主循环卡死
+#   - 附带显示：进程实例数、今日 state、最近日志错误计数、配置摘要
+function Get-RunStatus {
+    $lines = New-Object System.Collections.ArrayList
+
+    # 1) 心跳（读 state.json last_heartbeat_at，主脚本每轮写；≤10 分钟 = 正常）
+    $hbOk = $false
+    $hbTime = $null
+    $hbMissing = $true
+    if (Test-Path $script:StateFile) {
+        try {
+            $st = Get-Content -Path $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $st -and $null -ne $st.PSObject.Properties['last_heartbeat_at']) {
+                $hbRaw = [string]$st.last_heartbeat_at
+                if (-not [string]::IsNullOrWhiteSpace($hbRaw)) {
+                    $hbMissing = $false
+                    $hbTime = [datetime]::MinValue
+                    if ([datetime]::TryParseExact($hbRaw, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$hbTime)) {
+                        $hbOk = ((Get-Date) - $hbTime).TotalMinutes -le 10
+                    }
+                }
+            }
+        } catch { }
+    }
+
+    if ($hbOk) {
+        $null = $lines.Add('✅ 主程序运行中')
+        $null = $lines.Add(("   心跳: {0:yyyy-MM-dd HH:mm:ss}（{1:N0} 分钟前）" -f $hbTime, ((Get-Date) - $hbTime).TotalMinutes))
+    } else {
+        $null = $lines.Add('❌ 主程序未运行')
+        if ($hbMissing) {
+            $null = $lines.Add('   心跳: state.json 无 last_heartbeat_at（主脚本版本旧，需更新）')
+        } elseif ($null -eq $hbTime) {
+            $null = $lines.Add('   心跳: last_heartbeat_at 无法解析')
+        } else {
+            $null = $lines.Add(("   心跳: {0:yyyy-MM-dd HH:mm:ss}（已过期 {1:N1} 分钟）" -f $hbTime, ((Get-Date) - $hbTime).TotalMinutes))
+        }
+    }
+
+    # 2) 进程探测（辅助确认：按命令行匹配 clockin-reminder.ps1；非 Windows/权限不足时跳过不阻塞）
+    try {
+        $proc = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*clockin-reminder.ps1*' })
+        if ($proc.Count -gt 0) {
+            $null = $lines.Add(("   进程: 找到 {0} 个实例（PID {1}）" -f $proc.Count, (($proc | ForEach-Object { $_.ProcessId }) -join ', ')))
+        } elseif (-not $hbOk) {
+            $null = $lines.Add('   进程: 未找到 clockin-reminder.ps1 实例')
+        }
+    } catch {
+        $null = $lines.Add('   进程: 无法探测（非 Windows 环境或权限不足）')
+    }
+
+    # 3) 今日状态（state.json）
+    if (Test-Path $script:StateFile) {
+        try {
+            $st = Get-Content -Path $script:StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $today = (Get-Date).ToString('yyyy-MM-dd')
+            if ($null -ne $st -and $st.date -eq $today) {
+                $ckStr = if ([string]::IsNullOrWhiteSpace([string]$st.clockin_time)) { '--' } else { $st.clockin_time }
+                $null = $lines.Add(("   今日 {0}: 上班 {1} · 下班提醒 {2}" -f $today, $ckStr, $(if ($st.offwork_notified) { '已触发' } else { '未触发' })))
+            } else {
+                $null = $lines.Add(('   今日 {0}: 尚无记录' -f $today))
+            }
+        } catch {
+            $null = $lines.Add('   state.json 读取失败（可能损坏）')
+        }
+    } else {
+        $null = $lines.Add('   今日: 无 state.json（今天尚未解锁/打卡）')
+    }
+
+    # 4) 最近日志错误计数（log.txt 中 ERROR/失败/异常）
+    $errCount = 0
+    if (Test-Path $script:LogFile) {
+        try {
+            $errCount = @(Get-Content -Path $script:LogFile -Encoding UTF8 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '失败|异常|Error|错误' }).Count
+        } catch { }
+        $null = $lines.Add(("   日志: log.txt 共 {0} 条异常记录" -f $errCount))
+    } else {
+        $null = $lines.Add('   日志: log.txt 不存在（无异常记录）')
+    }
+
+    # 5) 配置摘要
+    if (Test-Path $script:ConfigFile) {
+        try {
+            $cfg = Get-Content -Path $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $null = $lines.Add(("   配置: 满 {0}h 提醒下班 · 上班窗 {1}-{2}点 · 循环 {3}min · {4}点截止{5}" -f
+                $cfg.OffWorkHours, $cfg.WorkWindowStart, $cfg.WorkAutoPopupEnd, $cfg.ReRemindIntervalMinutes, $cfg.MaxRemindHour,
+                $(if ($cfg.SkipWeekend) { ' · 周末跳过' } else { '' })))
+        } catch {
+            $null = $lines.Add('   配置: config.json 读取失败（可能损坏，主脚本将用默认值）')
+        }
+    } else {
+        $null = $lines.Add('   配置: config.json 不存在（使用默认配置）')
+    }
+
+    return $lines
+}
+
+# ============ 历史读取与解析（与主脚本一致：log 周文件 + 旧 history.csv 合并；R28）============
+function Read-HistoryFile {
+    param([string]$Path)
     $rows = @()
     if (-not (Test-Path $Path)) { return $rows }
     $lines = @(Get-Content -Path $Path -Encoding UTF8)
@@ -67,6 +172,27 @@ function Read-HistoryRows {
             offwork_actual = $(if ($cols.Count -ge 4) { $cols[3].Trim() } else { '' })
             duration       = $(if ($cols.Count -ge 5) { $cols[4].Trim() } else { '' })
         }
+    }
+    return $rows
+}
+
+# R28: 合并读取全部历史——log\*.csv 周文件（文件名=周一日期，按日期排序）+ 根目录旧 history.csv（迁移兼容）。
+# 只合并周数据文件（yyyy-MM-dd.csv）；跳过 week-*.csv 等非数据文件（旧导出格式，防止误解析进统计）。
+function Read-HistoryRows {
+    $rows = @()
+    $files = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:LogDir) -and (Test-Path $script:LogDir)) {
+        foreach ($f in @(Get-ChildItem -Path $script:LogDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $base = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            $fd = [datetime]::MinValue
+            if ([datetime]::TryParseExact($base, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$fd)) {
+                $null = $files.Add($f.FullName)
+            }
+        }
+    }
+    if (Test-Path $script:HistoryFile) { $null = $files.Add($script:HistoryFile) }
+    foreach ($f in @($files)) {
+        foreach ($row in @(Read-HistoryFile -Path $f)) { $rows += $row }
     }
     return $rows
 }
@@ -363,8 +489,22 @@ function Export-WeeklyCsv {
 
 # ============ 入口 ============
 $report = New-Object System.Collections.ArrayList
-if (-not (Test-Path $script:HistoryFile)) {
-    $null = $report.Add('history.csv 不存在，暂无记录。')
+# R32: 运行状态检查（主程序是否在跑）——始终置顶显示，双击 report-gui.bat 即可查看
+$null = $report.AddRange(@('==================== 运行状态 ====================', ''))
+try {
+    $null = $report.AddRange(@(Get-RunStatus))
+} catch {
+    $null = $report.AddRange(@("⚠️ 运行状态检查失败: $($_.Exception.Message)"))
+}
+$null = $report.AddRange(@('', '==================== 打卡统计 ===================='))
+# R28: 数据在 log 周文件（v8+）或旧根目录 history.csv（迁移兼容）；两者都没有才算无记录
+$logHasData = (Test-Path $script:LogDir) -and @(Get-ChildItem -Path $script:LogDir -Filter '*.csv' -File -ErrorAction SilentlyContinue | Where-Object {
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($_.Name)
+    $fd = [datetime]::MinValue
+    [datetime]::TryParseExact($base, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$fd)
+}).Count -gt 0
+if (-not $logHasData -and -not (Test-Path $script:HistoryFile)) {
+    $null = $report.Add('暂无打卡记录（log 周文件与 history.csv 均无数据）。')
 } else {
     if ($Days -gt 0)      { $null = $report.AddRange(@(Show-DaysReport -N $Days)) }
     elseif ($Month)       { $null = $report.AddRange(@(Show-MonthReport -d (Get-Date))) }
@@ -382,7 +522,7 @@ if ($Gui) {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = '打卡统计报告'
+    $form.Text = '打卡工具 · 运行状态与统计报告'
     $form.Size = New-Object System.Drawing.Size(820, 640)
     $form.StartPosition = 'CenterScreen'
     $form.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30)
