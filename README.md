@@ -11,8 +11,8 @@
 | `report.ps1` | 时长统计报告 + **运行状态检查**（命令行纯文本输出；`-Gui` 弹窗显示） |
 | `report-gui.bat` | **双击查看运行状态 + 统计报告**（GUI 窗口，任意时间想看就看） |
 | `config-gui.ps1` / `config-gui.bat` | **随时修改默认配置**（config.json 图形界面，不必等弹窗） |
-| `install.ps1` | 一键安装：拷脚本 + 注册开机自启 + 立即启动 |
-| `uninstall.ps1` | 一键卸载：停进程 + 删自启 + 删数据（选 N 保留 log 数据，重装可恢复） |
+| `install.bat` / `install.ps1` | **双击 install.bat 一键安装**：弹配置表单 + 注册开机自启 + 立即启动 |
+| `uninstall.bat` / `uninstall.ps1` | **双击 uninstall.bat 一键卸载**：停进程 + 删自启 + 删数据（选 N 保留 log 数据，重装可恢复） |
 
 ## 部署（在 Windows 上）
 
