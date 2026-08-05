@@ -1,4 +1,4 @@
-<#
+﻿<#
   uninstall.ps1  —  一键卸载打卡提醒工具（Windows）
   用法：powershell -NoProfile -ExecutionPolicy Bypass -File uninstall.ps1
   或双击运行。

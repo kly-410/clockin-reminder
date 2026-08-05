@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   clockin-reminder.ps1  —  打卡提醒常驻脚本 (v8)
   功能：

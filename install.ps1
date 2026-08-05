@@ -1,4 +1,4 @@
-<#
+﻿<#
   install.ps1  —  一键安装打卡提醒工具（Windows）v8
   用法：powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
   或右键「使用 PowerShell 运行」。

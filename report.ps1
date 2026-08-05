@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   report.ps1  —  打卡时长统计报告（纯文本，不弹窗，v8）
   用法（Windows PowerShell 5.1+）：

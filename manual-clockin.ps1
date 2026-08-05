@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   manual-clockin.ps1  —  手动打卡（周末/任意时间加班记录，v8）
   用法：
