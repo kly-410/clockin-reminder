@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   config-gui.ps1  —  随时修改打卡默认配置（v9）
   用法：
