@@ -8,7 +8,7 @@
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -All
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Days 7
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui          # GUI 窗口
-    powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui -Save   # GUI + 存 report-日期.csv
+    powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui -Save   # GUI + 存 log\report-日期.csv
     powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Help         # 显示本帮助
   说明：
     - 数据来自脚本同目录（log 周文件 + history.csv 兼容；R31）
@@ -557,9 +557,10 @@ if ($Gui) {
     $report | ForEach-Object { Write-Output $_ }
 }
 
-# -Save：把统计报告内容同时写入 report-<日期>.csv + 生成每周 log CSV（bat 调用时默认保存）
+# -Save：把统计报告内容同时写入 log\report-<日期>.csv + 生成每周 log CSV（bat 调用时默认保存）
 if ($Save) {
-    $savePath = Join-Path $script:DataDir ("report-{0:yyyyMMdd}.csv" -f (Get-Date))
+    if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+    $savePath = Join-Path $script:LogDir ("report-{0:yyyyMMdd}.csv" -f (Get-Date))   # R38: 报告产物也进 log 文件夹
     try {
         $report | Set-Content -Path $savePath -Encoding UTF8
     } catch {
