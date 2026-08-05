@@ -34,6 +34,7 @@ $script:DefaultConfig = @{
     SkipWeekend              = $true         # 周六/周日不提醒、不写历史
     ReRemindIntervalMinutes  = 30            # 满 10h 后默认每 30 分钟再弹一次（R15）
     MaxRemindHour            = 23            # 超过该小时不再自动提醒下班（防深夜骚扰；可手动记）（R15）
+    TargetMinutesPerWeek     = 3000          # 每周目标工时（分钟），默认 50h = 3000
 }
 $script:DataDir     = $PSScriptRoot
 $script:LogDir      = Join-Path $script:DataDir 'log'           # 数据统一目录（R38：配置/状态/日志/周记录全在 log）
@@ -141,6 +142,7 @@ function Reload-Config {
         $script:WorkAutoPopupEnd         = Get-ValidatedInt $cfg.WorkAutoPopupEnd         $d.WorkAutoPopupEnd         1   23
         $script:ReRemindIntervalMinutes  = Get-ValidatedInt $cfg.ReRemindIntervalMinutes  $d.ReRemindIntervalMinutes  1   480
         $script:MaxRemindHour            = Get-ValidatedInt $cfg.MaxRemindHour            $d.MaxRemindHour            0   23
+        $script:TargetMinutesPerWeek     = Get-ValidatedInt $cfg.TargetMinutesPerWeek     $d.TargetMinutesPerWeek     1   10080
         $script:SkipWeekend              = Get-ValidatedBool $cfg.SkipWeekend $d.SkipWeekend
     } catch {
         Write-Log "Reload-Config 失败，回退默认: $($_.Exception.Message)"
@@ -496,10 +498,10 @@ function Get-StatsSummaryLine {
     $mo = Get-MonthStats $now
     $parts = New-Object System.Collections.ArrayList
     $null = $parts.Add("本周工作日 $(Format-Duration $wk.Weekday)")
-    if ($wk.Weekday -ge 3000) {
-        $null = $parts.Add('✅ 达标 (≥50h)')
+    if ($wk.Weekday -ge $script:TargetMinutesPerWeek) {
+        $null = $parts.Add(('✅ 达标 (≥{0}h)' -f [math]::Round($script:TargetMinutesPerWeek / 60, 1)))
     } else {
-        $null = $parts.Add("还差 $(Format-Duration (3000 - $wk.Weekday)) 达 50h")
+        $null = $parts.Add("还差 $(Format-Duration ($script:TargetMinutesPerWeek - $wk.Weekday)) 达目标工时")
     }
     $null = $parts.Add("本月 $(Format-Duration $mo.Total)")
     return ($parts -join ' ｜ ')
@@ -1338,10 +1340,10 @@ function Invoke-OffWorkCheck {
     }
     $null = $statParts.Add("本周工作日合计 $(Format-Duration $wk.Weekday)")
     $statLine = $statParts -join ' ｜ '
-    if ($wk.Weekday -ge 3000) {
-        $statLine += ' ✅ 达标 (≥50h)'
+    if ($wk.Weekday -ge $script:TargetMinutesPerWeek) {
+        $statLine += (' ✅ 达标 (≥{0}h)' -f [math]::Round($script:TargetMinutesPerWeek / 60, 1))
     } else {
-        $statLine += " ⚠️ 还差 $(Format-Duration (3000 - $wk.Weekday)) 达 50h"
+        $statLine += " ⚠️ 还差 $(Format-Duration ($script:TargetMinutesPerWeek - $wk.Weekday)) 达目标工时"
     }
     $msg += "`n$statLine"
     # v11: 下班弹窗两个按钮——确定下班（填当前时间，记录并结束提醒）/ 稍后打卡（填当前时间，按配置间隔再次提醒）

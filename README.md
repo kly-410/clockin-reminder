@@ -28,6 +28,21 @@
 | 修改提醒时间等配置 | 双击 `config-gui.bat` |
 | 卸载 | 双击 `uninstall.bat` |
 
+## ⚙️ 可配置项
+
+所有配置可在 `log\config.json` 修改，或双击 `config-gui.bat` 图形界面调整：
+
+| 配置项 | 默认值 | 说明 |
+|:---|:---:|:---|
+| `OffWorkHours` | 10 | 上班打卡后几小时提醒下班 |
+| `WorkWindowStart` | 8 | 上班提醒最早时间（点）|
+| `WorkWindowEnd` | 10 | 打卡时间最晚（点）|
+| `WorkAutoPopupEnd` | 12 | 上班自动提醒最晚（点）|
+| `ReRemindIntervalMinutes` | 30 | 下班循环提醒间隔（分钟）|
+| `MaxRemindHour` | 23 | 最晚自动提醒小时（点）|
+| `TargetMinutesPerWeek` | 3000 | **每周目标工时（分钟）= 50h** |
+| `SkipWeekend` | true | 周六/周日跳过提醒 |
+
 ## 📁 数据在哪
 
 所有数据在脚本同目录的 `log` 文件夹：

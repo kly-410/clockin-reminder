@@ -34,6 +34,7 @@ $script:DefaultConfig = @{
     SkipWeekend              = $true
     ReRemindIntervalMinutes  = 30
     MaxRemindHour            = 23
+    TargetMinutesPerWeek     = 3000
 }
 
 # 读已有 config.json → 合并默认值（重装/已有配置时保留当前值）
@@ -100,7 +101,8 @@ function Show-ConfigForm {
         @{ Name = 'WorkWindowEnd';           Label = '打卡时间最晚（点）';            Min = 1;  Max = 23 },
         @{ Name = 'WorkAutoPopupEnd';        Label = '上班自动提醒最晚（点）';        Min = 1;  Max = 23 },
         @{ Name = 'ReRemindIntervalMinutes'; Label = '下班循环提醒间隔（分钟）';      Min = 1;  Max = 480 },
-        @{ Name = 'MaxRemindHour';           Label = '最晚自动提醒小时（点）';        Min = 0;  Max = 23 }
+        @{ Name = 'MaxRemindHour';           Label = '最晚自动提醒小时（点）';        Min = 0;  Max = 23 },
+        @{ Name = 'TargetMinutesPerWeek';    Label = '每周目标工时（分钟，默认3000=50h）'; Min = 1;  Max = 10080 }
     )
 
     $nuds = @{}

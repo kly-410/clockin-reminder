@@ -43,6 +43,7 @@ $script:HistoryFile  = Join-Path $script:DataDir 'history.csv'          # 旧单
 $script:LogDir       = Join-Path $script:DataDir 'log'                  # v8: 周文件目录
 $script:StateFile    = Join-Path $script:LogDir 'state.json'            # R38: 状态进 log（老版本在根目录，兼容回退）
 $script:ConfigFile   = Join-Path $script:LogDir 'config.json'           # R38: 配置进 log
+$script:TargetMinutesPerWeek = 3000   # 每周目标工时默认 50h（可在 config.json 配 TargetMinutesPerWeek）
 $script:LogFile      = Join-Path $script:LogDir 'log.txt'               # R38: 日志进 log
 
 # R38: 老版本数据在根目录（state.json / config.json / log.txt）→ 兼容回退读取（老版本升级后 report 也能查到）
@@ -150,8 +151,10 @@ function Get-RunStatus {
     if (Test-Path $script:ConfigFile) {
         try {
             $cfg = Get-Content -Path $script:ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            $null = $lines.Add(("   配置: 满 {0}h 提醒下班 · 上班窗 {1}-{2}点 · 循环 {3}min · {4}点截止{5}" -f
+            if ($cfg.TargetMinutesPerWeek) { $script:TargetMinutesPerWeek = [int]$cfg.TargetMinutesPerWeek }
+            $null = $lines.Add(("   配置: 满 {0}h 提醒下班 · 上班窗 {1}-{2}点 · 循环 {3}min · {4}点截止 · 周目标 {5}h{6}" -f
                 $cfg.OffWorkHours, $cfg.WorkWindowStart, $cfg.WorkAutoPopupEnd, $cfg.ReRemindIntervalMinutes, $cfg.MaxRemindHour,
+                [math]::Round(([double]($cfg.TargetMinutesPerWeek) / 60), 1),
                 $(if ($cfg.SkipWeekend) { ' · 周末跳过' } else { '' })))
         } catch {
             $null = $lines.Add('   配置: config.json 读取失败（可能损坏，主脚本将用默认值）')
@@ -349,11 +352,11 @@ function Show-WeekReport {
         $weekendMin += $r.Weekend
     }
     Write-Output ''
-    $threshold = 3000.0   # 50h * 60
+    $threshold = [double]($script:TargetMinutesPerWeek)   # 每周目标工时（默认 50h*60=3000）
     if ($weekdayMin -ge $threshold) {
-        Write-Output ("  工作日合计   {0}  ✅ 达标 (≥50h)" -f (Format-Duration $weekdayMin))
+        Write-Output ("  工作日合计   {0}  ✅ 达标 (≥{1}h)" -f (Format-Duration $weekdayMin), [math]::Round($threshold / 60, 1))
     } else {
-        Write-Output ("  工作日合计   {0}  ⚠️ 还差 {1} (需≥50h)" -f (Format-Duration $weekdayMin), (Format-Duration ($threshold - $weekdayMin)))
+        Write-Output ("  工作日合计   {0}  ⚠️ 还差 {1} (需≥{2}h)" -f (Format-Duration $weekdayMin), (Format-Duration ($threshold - $weekdayMin)), [math]::Round($threshold / 60, 1))
     }
     Write-Output ("  周末加班     {0}" -f (Format-Duration $weekendMin))
     Write-Output ("  本周总计     {0}" -f (Format-Duration ($weekdayMin + $weekendMin)))
@@ -470,10 +473,10 @@ function Export-WeeklyCsv {
         $null = $lines.Add(('工作日合计,,{0}' -f (Format-Duration $weekdayMin)))
         $null = $lines.Add(('周末加班,,{0}' -f (Format-Duration $weekendMin)))
         $null = $lines.Add(('本周总计,,{0}' -f (Format-Duration ($weekdayMin + $weekendMin))))
-        if ($weekdayMin -ge 3000) {
-            $null = $lines.Add('50h达标,,✅ 达标 (≥50h)')
+        if ($weekdayMin -ge $script:TargetMinutesPerWeek) {
+            $null = $lines.Add(('50h达标,,✅ 达标 (≥{0}h)' -f [math]::Round($script:TargetMinutesPerWeek / 60, 1)))
         } else {
-            $null = $lines.Add(('50h达标,,⚠️ 还差 {0} 达 50h' -f (Format-Duration (3000 - $weekdayMin))))
+            $null = $lines.Add(('50h达标,,⚠️ 还差 {0} 达目标工时' -f (Format-Duration ($script:TargetMinutesPerWeek - $weekdayMin))))
         }
 
         # 本月累计（满足"包含该月已有数据"）— 内联计算（report 无 Get-MonthStats）
