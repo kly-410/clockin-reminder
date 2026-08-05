@@ -47,7 +47,7 @@ $script:LogFile      = Join-Path $script:DataDir 'log.txt'              # R32: �
 $script:SkippedLines = New-Object System.Collections.ArrayList
 
 # ============ 运行状态检查（R32：双击 report-gui.bat 即可查看主程序是否正常运行）============
-# 判定逻辑（与 status.ps1 一致，心跳源 = state.json last_heartbeat_at）：
+# 判定逻辑（心跳源 = state.json last_heartbeat_at）：
 #   - state.json 的 last_heartbeat_at ≤10 分钟前更新 → 运行中（主脚本每 2 分钟写一次）
 #   - 心跳缺失或过期 → 未运行 / 主循环卡死
 #   - 附带显示：进程实例数、今日 state、最近日志错误计数、配置摘要

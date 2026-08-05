@@ -158,7 +158,7 @@ function Write-Log {
     } catch { }
 }
 
-# ============ 心跳（R32：status.ps1 / report.ps1 据此判断主程序是否在运行）============
+# ============ 心跳（R32：report.ps1 据此判断主程序是否在运行）============
 # 主循环每轮（2 分钟）往 state.json 写 last_heartbeat_at 字段：
 # 存在且 ≤10 分钟内更新 = 运行正常；缺失/过期 = 未运行 / 主循环卡死。
 # 只加一个字段，不改任何现有字段语义；复用 Read-State/Write-State/Invoke-DataLocked，不新造锁。

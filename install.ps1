@@ -259,5 +259,4 @@ Write-Host "  脚本目录 : $dstDir"
 Write-Host '  配置文件 : config.json（弹窗底部「解锁更改配置」可再次修改）'
 Write-Host '  手动打卡 : 双击 manual-clockin.ps1（周末加班记录）'
 Write-Host '  统计报告 : powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1'
-Write-Host '  运行状态查询 : 双击 status-check.bat'
 Write-Host '  测试方法 : Win+L 锁屏再解锁，应弹出上班打卡提醒'
