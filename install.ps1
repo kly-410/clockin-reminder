@@ -19,7 +19,15 @@ Add-Type -AssemblyName System.Drawing
 $srcDir    = $PSScriptRoot
 $dstDir    = $PSScriptRoot   # R31: 就地安装——数据与代码同目录，方便查找（不再拷到 %USERPROFILE%）
 $scriptPath = Join-Path $dstDir 'clockin-reminder.ps1'
-$configFile = Join-Path $dstDir 'config.json'
+$configFile = Join-Path $dstDir 'log\config.json'        # R38: 配置统一放 log 文件夹
+$legacyConfigFile = Join-Path $dstDir 'config.json'      # R38: 老版本根目录配置，兼容读取预填
+
+# R38: 配置路径解析——优先 log\config.json；不存在且根目录有旧 config.json 时用旧的（老版本升级场景）
+function Resolve-ConfigPath {
+    if (Test-Path $configFile) { return $configFile }
+    if (Test-Path $legacyConfigFile) { return $legacyConfigFile }
+    return $configFile
+}
 
 # ============ R22: 配置表单 ============
 # 默认配置（与主脚本 clockin-reminder.ps1 的 DefaultConfig 保持一致）
@@ -223,7 +231,8 @@ Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.e
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # 0.5 R22: 弹配置表单；确定则写 config.json，取消用默认（不写，主脚本首次运行自动创建默认）
-$cfgResult = Show-ConfigForm -cfg (Read-ExistingConfig -Path $configFile)
+# R38: 读取兼容老版本根目录 config.json；保存写 log\config.json（Write-ConfigFile 自动建 log 目录）
+$cfgResult = Show-ConfigForm -cfg (Read-ExistingConfig -Path (Resolve-ConfigPath))
 if ($null -ne $cfgResult) {
     Write-ConfigFile -Path $configFile -cfg $cfgResult
     Write-Host ''
@@ -256,7 +265,8 @@ if (Confirm-ProcessAlive) {
     Write-Host '[警告] 未检测到常驻进程（可能启动即退出），请查看 log.txt' -ForegroundColor Yellow
 }
 Write-Host "  脚本目录 : $dstDir"
-Write-Host '  配置文件 : config.json（弹窗底部「解锁更改配置」可再次修改）'
+Write-Host '  配置文件 : log\config.json（弹窗底部「解锁更改配置」可再次修改）'
 Write-Host '  手动打卡 : 双击 manual-clockin.ps1（周末加班记录）'
 Write-Host '  统计报告 : powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1'
 Write-Host '  测试方法 : Win+L 锁屏再解锁，应弹出上班打卡提醒'
+Write-Host '  数据说明 : 所有数据在 log 文件夹（周记录/配置/状态/日志）；重装只保留 log 文件夹即不丢数据'

@@ -11,10 +11,11 @@
     7. offwork_actual 同一天多次确认取最晚（R16）
     8. 全天缺勤补记：工作日 20 点后无记录补 0h 0min；启动时补前一天 0h 0min（R19）
     9. 配置持久化到 config.json；弹窗底部配置区先解锁才能改，保存后下次轮询生效（R21/R23）
-  数据文件：脚本同目录（R31，不再用 %USERPROFILE%\.clockin-reminder\）
-    state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at）
-    log\<周一日期>.csv  历史记录按周归档，每周一个文件（日期,上班时间,预计下班,实际下班,工作时长；v8 起 offwork 时间存完整 datetime，可能次日）
-    log.txt      异常日志
+  数据文件：全部在脚本同目录 log 文件夹（R38，不再用 %USERPROFILE%\\.clockin-reminder\\；重装/升级只保留 log 文件夹即保留全部数据）
+    log\\config.json  配置（老版本在根目录，R38 启动自动迁移进 log）
+    log\\state.json   状态（date / work_reminder_shown / clockin_time / offwork_at / offwork_notified / next_remind_at / last_heartbeat_at）
+    log\\<周一日期>.csv  历史记录按周归档，每周一个文件（日期,上班时间,预计下班,实际下班,工作时长；v8 起 offwork 时间存完整 datetime，可能次日）
+    log\\log.txt      异常日志
   根目录 history.csv 仅作旧数据迁移兼容读取，写入一律进 log 周文件（R28）
   运行：
     powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File clockin-reminder.ps1
@@ -35,11 +36,29 @@ $script:DefaultConfig = @{
     MaxRemindHour            = 23            # 超过该小时不再自动提醒下班（防深夜骚扰；可手动记）（R15）
 }
 $script:DataDir     = $PSScriptRoot
-$script:ConfigFile  = Join-Path $script:DataDir 'config.json'
-$script:StateFile   = Join-Path $script:DataDir 'state.json'
+$script:LogDir      = Join-Path $script:DataDir 'log'           # 数据统一目录（R38：配置/状态/日志/周记录全在 log）
+$script:ConfigFile  = Join-Path $script:LogDir 'config.json'    # R38: 配置进 log（老版本在根目录，启动时自动迁移）
+$script:StateFile   = Join-Path $script:LogDir 'state.json'     # R38: 状态进 log
 $script:HistoryFile = Join-Path $script:DataDir 'history.csv'   # R28: 旧版单一文件，仅迁移兼容读取
-$script:LogDir      = Join-Path $script:DataDir 'log'           # R28: 历史记录按周归档 log\<周一日期>.csv
-$script:LogFile     = Join-Path $script:DataDir 'log.txt'
+$script:LogFile     = Join-Path $script:LogDir 'log.txt'        # R38: 日志进 log
+
+# R38: 老版本数据在根目录（config.json / state.json / log.txt）→ 启动时迁入 log 文件夹。
+# 目的：所有运行产物统一放 log，重装/升级只保留 log 文件夹即保留全部数据。
+function Initialize-DataLayout {
+    if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+    foreach ($f in @('config.json', 'state.json', 'log.txt')) {
+        $src = Join-Path $script:DataDir $f
+        $dst = Join-Path $script:LogDir $f
+        if ((Test-Path $src) -and (-not (Test-Path $dst))) {
+            try {
+                Move-Item -Path $src -Destination $dst -Force -ErrorAction Stop
+            } catch {
+                try { Copy-Item -Path $src -Destination $dst -Force -ErrorAction Stop; Remove-Item $src -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+    }
+}
+Initialize-DataLayout
 
 # R21: 读 config.json → 合并后的 hashtable；缺失字段用默认值；文件不存在返回默认值
 function Read-Config {

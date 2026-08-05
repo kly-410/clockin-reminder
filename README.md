@@ -12,7 +12,7 @@
 | `report-gui.bat` | **双击查看运行状态 + 统计报告**（GUI 窗口，任意时间想看就看） |
 | `config-gui.ps1` / `config-gui.bat` | **随时修改默认配置**（config.json 图形界面，不必等弹窗） |
 | `install.ps1` | 一键安装：拷脚本 + 注册开机自启 + 立即启动 |
-| `uninstall.ps1` | 一键卸载：停进程 + 删自启 + 删数据 |
+| `uninstall.ps1` | 一键卸载：停进程 + 删自启 + 删数据（选 N 保留 log 数据，重装可恢复） |
 
 ## 部署（在 Windows 上）
 
@@ -23,9 +23,11 @@
    ```
 3. 完成。开机自启已注册（HKCU Run，无需管理员）。
 
-`install.ps1`（v7 起）先弹**配置表单**（预填已存在的 config.json，重装时保留当前配置）：
-- 点「确定（保存配置并安装）」→ 写 config.json 并继续安装
+`install.ps1`（v7 起）先弹**配置表单**（预填已存在的 config.json——log 或根目录旧配置，重装时保留当前配置）：
+- 点「确定（保存配置并安装）」→ 写 `log\config.json` 并继续安装
 - 点「取消（用默认值）」→ 用默认配置继续（首次运行主脚本会自动创建 config.json）
+
+**重装/升级不丢数据**：install 不删任何数据；只要 `log` 文件夹还在（没被手动删/卸载时选 N），重装后主程序直接读取 `log` 里的打卡记录、配置、状态。
 
 v8 起，install 杀旧实例后、启动新实例前，会等待旧实例的单实例 Mutex 释放（最多 10 秒，每 0.5 秒试一次），避免新实例因 `WaitOne(0)` 失败直接退出导致装完没有常驻进程；启动后还会轮询 3 秒确认常驻进程确实存活（R30），没起来会给出警告提示查看 `log.txt`。
 
@@ -59,7 +61,7 @@ v8 起，install 杀旧实例后、启动新实例前，会等待旧实例的单
 **随时改默认配置，不必等上班/下班弹窗**：双击 `config-gui.bat`（或命令行 `powershell -NoProfile -ExecutionPolicy Bypass -File config-gui.ps1`）。
 
 - 图形界面列出全部配置项：下班提醒小时 / 上班提醒最早 / 打卡时间最晚 / 上班自动提醒最晚 / 下班循环间隔 / 最晚自动提醒 / 周末跳过
-- 保存写入脚本同目录 `config.json`（原子写）；**主程序最多 2 分钟轮询自动生效**（R23），想立即生效就重跑一次 `install.ps1`
+- 保存写入 `log\config.json`（原子写；老版本根目录 config.json 自动兼容读取，保存后落在 log）；**主程序最多 2 分钟轮询自动生效**（R23），想立即生效就重跑一次 `install.ps1`
 - 与 install.ps1 的配置表单同一套视觉与校验（上班最早不能晚于自动提醒最晚 / 打卡最晚）
 
 **弹窗里也能改**（R23）：上班/下班弹窗底部有「解锁更改配置」按钮，点开后显示每项配置名称 + 数字框（下班提醒小时 / 上班最早 / 打卡最晚 / 自动弹最晚 / 循环间隔 / 最晚提醒 / 周末跳过），改完点「保存配置」写 config.json。配置项名称默认隐藏，解锁后与数字框一起显示（v9 修复）。
@@ -113,17 +115,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹�
 
 ## 数据文件（log 周文件）
 
-数据与脚本**同目录**（R31，就地安装，不再用 `%USERPROFILE%\.clockin-reminder\`），v8 起历史记录**按周归档**：
+数据与脚本**同目录**（R31，就地安装，不再用 `%USERPROFILE%\\.clockin-reminder\\`），R38 起**所有运行产物统一放 `log` 文件夹**（周记录 / 配置 / 状态 / 日志）：
 
 ```
 <脚本所在目录>\
-  config.json              配置
-  state.json               状态（date / clockin_time / offwork_at / next_remind_at / last_heartbeat_at 心跳，R32）
-  log\2026-08-03.csv       本周记录（文件名 = 该周周一的日期）
-  log\2026-08-10.csv       上周记录
+  log\config.json            配置（R38 从根目录迁入；老版本升级启动时自动迁移）
+  log\state.json             状态（date / clockin_time / offwork_at / next_remind_at / last_heartbeat_at 心跳，R32）
+  log\log.txt                异常日志
+  log\2026-08-03.csv         本周记录（文件名 = 该周周一的日期）
+  log\2026-08-10.csv         上周记录
   ...
-  history.csv              旧版单一文件（v8 起不再写入；若存在，读取时仍合并，迁移兼容）
+  history.csv                旧版单一文件（v8 起不再写入；若存在，读取时仍合并，迁移兼容）
 ```
+
+**重装/升级保留数据**：只要不删除 `log` 文件夹，再次安装后主程序自动读取 `log` 里的全部数据（打卡记录 / 配置 / 状态）。老版本根目录的 `config.json` / `state.json` / `log.txt` 在升级后首次启动自动迁入 `log` 文件夹，配置不丢。
 
 每个周文件表头 5 列：
 
@@ -149,11 +154,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File report.ps1 -Gui       # 弹�
 ## 验证
 
 1. 按 `Win+L` 锁屏再解锁（工作日 8-12 点）→ 应弹出上班提醒
-2. 查看记录（脚本同目录）：
+2. 查看记录（脚本同目录，数据全在 `log` 文件夹）：
    ```powershell
-   Get-Content ".\state.json"
+   Get-Content ".\log\state.json"
    Get-Content ".\log\*.csv"      # 按周归档的历史记录
-   Get-Content ".\log.txt"        # 异常日志
+   Get-Content ".\log\log.txt"    # 异常日志
    ```
 3. 快速验证：把主脚本里 `$script:WorkWindowStart = 8` 改成 `0`、`$script:OffWorkHours = 10` 改成 `0.05`（3 分钟），
    重跑 `install.ps1` → 立即弹上班提醒，填时间后 3 分钟弹下班提醒。验完改回。
@@ -164,7 +169,7 @@ v8 起历史记录**本身就按周归档**：每天记录写入当天所在周�
 
 - 文件名 = 该周周一的日期，例如 `log\2026-08-03.csv` 存 8/3~8/9 这一周
 - 统计（report / 弹窗 / 50h 达标）读取时合并所有周文件 + 旧 `history.csv`，跨周/跨月无感知
-- 旧版根目录 `history.csv` 不再写入，仅保留读取兼容；`uninstall` 会连同 `log` 子文件夹一起删除
+- 旧版根目录 `history.csv` 不再写入，仅保留读取兼容；`uninstall` 会连同 `log` 文件夹一起删除（Y 确认时）
 
 ## 常见问题
 
@@ -174,7 +179,7 @@ v8 起历史记录**本身就按周归档**：每天记录写入当天所在周�
 
 ## 卸载
 
-双击或命令行运行 `uninstall.ps1`（停进程 + 删自启 + 删数据文件含 `log` 子文件夹，删数据前会确认；R31 起只删数据文件、保留脚本本身）：
+双击或命令行运行 `uninstall.ps1`（停进程 + 删自启 + 删数据，删数据前会确认；**选 N 保留 `log` 文件夹，重装后自动恢复全部数据**；R31 起只删数据文件、保留脚本本身）：
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File uninstall.ps1
 ```
@@ -189,9 +194,9 @@ Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.e
 # 2. 删开机自启项
 Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'ClockinReminder'
 
-# 3. 删数据文件（脚本同目录）
+# 3. 删数据（数据全在 log 文件夹；删了 log 即重装不恢复）
 Remove-Item ".\log" -Recurse -Force
-Remove-Item ".\log.txt", ".\history.csv", ".\state.json", ".\config.json" -Force
+Remove-Item ".\history.csv" -Force   # 旧版残留（如有）
 ```
 
 ## 说明

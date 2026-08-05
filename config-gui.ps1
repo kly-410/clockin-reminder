@@ -14,7 +14,16 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $script:DataDir     = $PSScriptRoot
-$script:ConfigFile  = Join-Path $script:DataDir 'config.json'
+$script:LogDir      = Join-Path $script:DataDir 'log'
+$script:ConfigFile  = Join-Path $script:LogDir 'config.json'    # R38: 配置统一放 log 文件夹
+$script:LegacyConfigFile = Join-Path $script:DataDir 'config.json'   # R38: 老版本根目录配置，兼容读取
+
+# R38: 配置路径解析——优先 log\\config.json；不存在且根目录有旧 config.json 时用旧的（老版本升级场景）
+function Resolve-ConfigPath {
+    if (Test-Path $script:ConfigFile) { return $script:ConfigFile }
+    if (Test-Path $script:LegacyConfigFile) { return $script:LegacyConfigFile }
+    return $script:ConfigFile
+}
 
 # 与主脚本 clockin-reminder.ps1 的 DefaultConfig 保持一致
 $script:DefaultConfig = @{
@@ -176,7 +185,8 @@ function Show-ConfigForm {
 }
 
 # ============ 入口 ============
-$cfg = Read-ExistingConfig -Path $script:ConfigFile
+# R38: 读取时兼容老版本根目录 config.json；保存始终写 log\\config.json（Write-ConfigFile 自动建 log 目录）
+$cfg = Read-ExistingConfig -Path (Resolve-ConfigPath)
 $result = Show-ConfigForm -cfg $cfg
 if ($null -ne $result) {
     Write-ConfigFile -Path $script:ConfigFile -cfg $result

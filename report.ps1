@@ -41,9 +41,24 @@ if ($Help) {
 $script:DataDir      = $PSScriptRoot
 $script:HistoryFile  = Join-Path $script:DataDir 'history.csv'          # 旧单文件（兼容，若存在也合并读）
 $script:LogDir       = Join-Path $script:DataDir 'log'                  # v8: 周文件目录
-$script:StateFile    = Join-Path $script:DataDir 'state.json'           # R32: 运行状态检查用
-$script:ConfigFile   = Join-Path $script:DataDir 'config.json'          # R32: 运行状态检查用
-$script:LogFile      = Join-Path $script:DataDir 'log.txt'              # R32: 运行状态检查用
+$script:StateFile    = Join-Path $script:LogDir 'state.json'            # R38: 状态进 log（老版本在根目录，兼容回退）
+$script:ConfigFile   = Join-Path $script:LogDir 'config.json'           # R38: 配置进 log
+$script:LogFile      = Join-Path $script:LogDir 'log.txt'               # R38: 日志进 log
+
+# R38: 老版本数据在根目录（state.json / config.json / log.txt）→ 兼容回退读取（老版本升级后 report 也能查到）
+foreach ($f in @('state.json', 'config.json', 'log.txt')) {
+    $new = Join-Path $script:LogDir $f
+    if (-not (Test-Path $new)) {
+        $old = Join-Path $script:DataDir $f
+        if (Test-Path $old) {
+            switch ($f) {
+                'state.json'  { $script:StateFile  = $old }
+                'config.json' { $script:ConfigFile = $old }
+                'log.txt'     { $script:LogFile    = $old }
+            }
+        }
+    }
+}
 $script:SkippedLines = New-Object System.Collections.ArrayList
 
 # ============ 运行状态检查（R32：双击 report-gui.bat 即可查看主程序是否正常运行）============
