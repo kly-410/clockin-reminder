@@ -7,7 +7,7 @@
     3. 上班/下班弹窗在独立 runspace 线程中运行，不阻塞主循环（R2）
     4. 打卡时间 + 10 小时后主循环弹下班提醒；跨天未确认的下班提醒在工作日补弹（R8）
     5. 下班确认把实际时间写入 log 周文件；下班弹窗附带今日/本周工作时长统计（R10/R12）
-    6. 下班提醒循环触发：确认一次后按 ReRemindIntervalMinutes 再提醒，直到不再确认或超过 MaxRemindHour（R15/R17）
+    6. 下班弹窗两个按钮：确定下班（填当前时间，记录实际下班并结束提醒）/ 稍后打卡（填当前时间，弹窗先关，按 ReRemindIntervalMinutes 配置间隔再次弹窗，直到确定下班或超过 MaxRemindHour）（R15/R17/v11）
     7. offwork_actual 同一天多次确认取最晚（R16）
     8. 全天缺勤补记：工作日 20 点后无记录补 0h 0min；启动时补前一天 0h 0min（R19）
     9. 配置持久化到 config.json；弹窗底部配置区先解锁才能改，保存后下次轮询生效（R21/R23）
@@ -586,12 +586,12 @@ function Set-HistoryOffworkActual {
 
 # R15: 下班确认回写（弹窗线程调用）。
 # 校验 state 当前待提醒基准 == 发起弹窗时的基准，防旧弹窗串改新一天数据（ExpectedOffworkAt 防串改）。
-# 确认后：offwork_notified=$false 允许再次提醒；next_remind_at = 确认时间 + ReRemindIntervalMinutes。
+# v11: 「确定下班」= 结束提醒循环：offwork_notified=$true（当天不再弹）、清空 next_remind_at，写实际下班时间。
 function Invoke-OffworkConfirm {
     param(
         [string]$ExpectedOffworkAt,
         [datetime]$ConfirmedAt,
-        [int]$ReRemindIntervalMinutes = $script:ReRemindIntervalMinutes
+        [int]$ReRemindIntervalMinutes = $script:ReRemindIntervalMinutes   # 保留参数（兼容签名），v11 确定下班不再安排循环
     )
     try {
         $state = Read-State
@@ -602,14 +602,46 @@ function Invoke-OffworkConfirm {
             Write-Log "Invoke-OffworkConfirm 跳过：state 基准 [$stateBase] != 发起时基准 [$ExpectedOffworkAt]（旧弹窗防串改）"
             return $false
         }
-        $state.offwork_notified = $false
-        $state.next_remind_at = $ConfirmedAt.AddMinutes($ReRemindIntervalMinutes).ToString('yyyy-MM-dd HH:mm:ss')
+        # v11: 确定下班 → 不再自动循环提醒
+        $state.offwork_notified = $true
+        $state.next_remind_at = $null
         Write-State $state
         # R10/R16: 实际确认时间写入历史（取最晚）
         Set-HistoryOffworkActual -date $state.date -actual $ConfirmedAt.ToString('yyyy-MM-dd HH:mm:ss')
         return $true
     } catch {
         Write-Log "弹窗确认回写失败: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# v11: 「稍后打卡」回写（弹窗线程调用）——不写历史，关闭弹窗并按配置间隔安排下次提醒。
+# 校验基准同上（防串改）。offwork_notified=$false（允许下次再弹）；next_remind_at = max(锚点, 当前时刻) + ReRemindIntervalMinutes。
+function Invoke-OffworkLater {
+    param(
+        [string]$ExpectedOffworkAt,
+        [datetime]$AnchorAt,     # 用户输入的"当前时间"（下次提醒基准）
+        [int]$ReRemindIntervalMinutes = $script:ReRemindIntervalMinutes
+    )
+    try {
+        $state = Read-State
+        if (-not $state) { return $false }
+        $stateBase = if (-not [string]::IsNullOrWhiteSpace([string]$state.next_remind_at)) { [string]$state.next_remind_at } else { [string]$state.offwork_at }
+        if ($stateBase -ne $ExpectedOffworkAt) {
+            Write-Log "Invoke-OffworkLater 跳过：state 基准 [$stateBase] != 发起时基准 [$ExpectedOffworkAt]（旧弹窗防串改）"
+            return $false
+        }
+        # 锚点取 max(用户输入, 当前时刻)——防止填早了（输入 < now）导致 next_remind_at 已过、主循环立即再弹
+        $now = Get-Date
+        $base = $AnchorAt
+        if ($base -lt $now) { $base = $now }
+        $state.offwork_notified = $false
+        $state.next_remind_at = $base.AddMinutes($ReRemindIntervalMinutes).ToString('yyyy-MM-dd HH:mm:ss')
+        Write-State $state
+        Write-Log "稍后打卡：$($ReRemindIntervalMinutes) 分钟后（$($state.next_remind_at)）再提醒"
+        return $true
+    } catch {
+        Write-Log "稍后打卡回写失败: $($_.Exception.Message)"
         return $false
     }
 }
@@ -711,7 +743,8 @@ function Show-MandatoryDialog {
         [bool]$WithInput = $false,
         [string]$InputDefault = '',
         [int]$WorkStart = $script:WorkWindowStart,
-        [int]$WorkEnd = $script:WorkWindowEnd
+        [int]$WorkEnd = $script:WorkWindowEnd,
+        [bool]$OffworkMode = $false   # v11: 下班模式——双按钮（确定下班 / 稍后打卡），均需先填当前时间
     )
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     $w = [int]($screen.Width * 0.9)
@@ -727,14 +760,14 @@ function Show-MandatoryDialog {
     $form.BackColor = [System.Drawing.Color]::FromArgb(255, 255, 0)       # 刺眼黄
     $form.TopMost = $true
     $form.KeyPreview = $true
-    $form.Tag = @{ Value = $null; Input = $null; Skipped = $false; WithInput = $WithInput; WorkStart = $WorkStart; WorkEnd = $WorkEnd }
+    $form.Tag = @{ Result = $null; Input = $null; Skipped = $false; WithInput = $WithInput; WorkStart = $WorkStart; WorkEnd = $WorkEnd; OffworkMode = $OffworkMode }
 
     # 拦截 Esc
     $form.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $_.SuppressKeyPress = $true } })
     # 拦截 Alt+F4 / 一切关闭：未确认且未点后门按钮前禁止关窗
     $form.Add_FormClosing({
         param($sender, $e)
-        if ($null -eq $sender.Tag.Value -and -not $sender.Tag.Skipped) { $e.Cancel = $true }
+        if ($null -eq $sender.Tag.Result -and -not $sender.Tag.Skipped) { $e.Cancel = $true }
     })
 
     $label = New-Object System.Windows.Forms.Label
@@ -776,12 +809,17 @@ function Show-MandatoryDialog {
     }
 
     $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = $(if ($WithInput) { '确认已打卡' } else { '确认已下班' })
+    if ($OffworkMode) {
+        $btn.Text = '确定下班'
+        $btn.SetBounds(($cx - 340), ($h - 220), 320, 140)
+    } else {
+        $btn.Text = $(if ($WithInput) { '确认已打卡' } else { '确认已下班' })
+        $btn.SetBounds(($cx - 300), ($h - 220), 600, 140)
+    }
     $btn.Font = New-Object System.Drawing.Font('Microsoft YaHei', 36, [System.Drawing.FontStyle]::Bold)
     $btn.ForeColor = [System.Drawing.Color]::Red
     $btn.BackColor = [System.Drawing.Color]::White
     $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $btn.SetBounds(($cx - 300), ($h - 220), 600, 140)
     $btn.Add_Click({
         param($sender, $e)
         $f = $sender.FindForm()
@@ -804,14 +842,41 @@ function Show-MandatoryDialog {
                     '确认', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
                 if ($ask -ne [System.Windows.Forms.DialogResult]::Yes) { return }
             }
-            $tag.Value = $t.ToString('HH:mm')
+            $tag.Result = @{ Action = 'confirm'; Value = $t.ToString('HH:mm') }
         } else {
-            $tag.Value = $true
+            $tag.Result = @{ Action = 'confirm'; Value = $null }
         }
         $f.Close()
     })
     $form.Controls.Add($btn)
-    $form.AcceptButton = $btn   # Enter 键提交（R9）
+    $form.AcceptButton = $btn   # Enter 键提交（R9）——下班模式默认回车 = 确定下班
+
+    if ($OffworkMode) {
+        # v11: 稍后打卡——关闭弹窗，按 ReRemindIntervalMinutes（配置「满 X 小时后多久提醒」）间隔再次弹窗
+        $btnLater = New-Object System.Windows.Forms.Button
+        $btnLater.Text = '稍后打卡'
+        $btnLater.Font = New-Object System.Drawing.Font('Microsoft YaHei', 36, [System.Drawing.FontStyle]::Bold)
+        $btnLater.ForeColor = [System.Drawing.Color]::Red
+        $btnLater.BackColor = [System.Drawing.Color]::White
+        $btnLater.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $btnLater.SetBounds(($cx + 20), ($h - 220), 320, 140)
+        $btnLater.Add_Click({
+            param($sender, $e)
+            $f = $sender.FindForm()
+            $tag = $f.Tag
+            $text = $tag.Input.Text.Trim()
+            $t = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact($text, [string[]]@('HH:mm', 'H:mm'), $null,
+                    [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
+                [System.Windows.Forms.MessageBox]::Show('时间格式不对，请填 HH:mm 或 H:mm，例如 08:30 或 8:30', '输入错误') | Out-Null
+                return
+            }
+            # 稍后打卡：填当前时间即可（作为下次提醒锚点），不卡打卡时间范围
+            $tag.Result = @{ Action = 'later'; Value = $t.ToString('HH:mm') }
+            $f.Close()
+        })
+        $form.Controls.Add($btnLater)
+    }
 
     # 后门按钮：紧急逃生（防调试时强制弹窗卡死电脑）。低调放右下角，点它关闭弹窗且不写任何打卡数据。
     # 主循环弹窗前已置防重复标记（work_reminder_shown / offwork_notified），关闭后当天不会再弹，不会死循环。
@@ -979,7 +1044,7 @@ function Show-MandatoryDialog {
 
     $null = $form.ShowDialog()
     if ($form.Tag.Skipped) { return $null }   # 逃生：调用方当"未确认"处理
-    return $form.Tag.Value
+    return $form.Tag.Result   # v11: @{ Action='confirm'|'later'; Value='HH:mm' }；上班模式 Action='confirm'
 }
 
 # ============ 异步弹窗（R2：runspace 线程，不阻塞主循环）============
@@ -993,6 +1058,7 @@ function Start-DialogRunspace {
         [string]$Message,
         [string]$SubMessage = '',
         [string]$InputDefault = '',
+        [bool]$WithInput = ($Kind -eq 'work'),   # v11: 下班弹窗也要手动输入当前时间（默认上班 true）
         [string]$ExpectedOffworkAt = '',  # 下班弹窗确认时校验，防止旧弹窗串改新一天数据
         [string]$WorkdayDate = '',        # P1-2: 弹窗所属工作日（yyyy-MM-dd）；跨天确认用它做周末守卫，防止周五弹周六确认被吞
         [int]$WorkEnd = $script:WorkWindowEnd   # R18: 打卡时间上限（提示用；下午到放宽到当前时刻）
@@ -1025,6 +1091,7 @@ function Start-DialogRunspace {
         $null = $ps.AddScript("function Format-RowDuration { $((Get-Command -Name 'Format-RowDuration').Definition) }")
         $null = $ps.AddScript("function Test-ClockinTimeRange { $((Get-Command -Name 'Test-ClockinTimeRange').Definition) }")
         $null = $ps.AddScript("function Invoke-OffworkConfirm { $((Get-Command -Name 'Invoke-OffworkConfirm').Definition) }")
+        $null = $ps.AddScript("function Invoke-OffworkLater { $((Get-Command -Name 'Invoke-OffworkLater').Definition) }")
         $null = $ps.AddScript("function Write-Log { $((Get-Command -Name 'Write-Log').Definition) }")
         $null = $ps.AddScript("function Read-Config { $((Get-Command -Name 'Read-Config').Definition) }")
         $null = $ps.AddScript("function Write-Config { $((Get-Command -Name 'Write-Config').Definition) }")
@@ -1055,6 +1122,7 @@ $dialogParams = @{
     InputDefault = $ctx.InputDefault
     WorkStart   = $ctx.WorkWindowStart
     WorkEnd     = $ctx.WorkWindowEnd
+    OffworkMode = ($ctx.Kind -eq 'offwork')   # v11: 下班模式双按钮
 }
 $result = Show-MandatoryDialog @dialogParams
 if ($null -eq $result) { return }   # 保险：没确认到（正常流程不会）
@@ -1063,7 +1131,7 @@ try {
     if ($ctx.Kind -eq 'work') {
         # P1-2: 用发起日判断（弹窗跨天到周末不吞确认）；WorkdayDate 为空时 Test-WorkdayAt 回退当前时刻
         if (-not (Test-WorkdayAt $ctx.WorkdayDate)) { return }
-        $clockinDt = [datetime]::ParseExact($result, 'HH:mm', $null)
+        $clockinDt = [datetime]::ParseExact($result.Value, 'HH:mm', $null)
         # P1-2: 日期、预计下班都锚定发起日，避免跨天确认时记到/算到第二天
         $workDate = [datetime]::MinValue
         if (-not [datetime]::TryParseExact($ctx.WorkdayDate, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$workDate)) { $workDate = (Get-Date).Date }
@@ -1072,18 +1140,38 @@ try {
         $state = Read-State
         if (-not $state) { $state = @{} }
         $state.date = $today
-        $state.clockin_time = $result
+        $state.clockin_time = $result.Value
         $state.offwork_at = $offworkAt.ToString('yyyy-MM-dd HH:mm:ss')
         $state.offwork_notified = $false
         $state.next_remind_at = $null   # R15: 新工作日清掉昨天的循环提醒链，重新从首次提醒开始
         $state.work_reminder_shown = $true
         Write-State $state
-        Add-HistoryLine -date $today -clockin $result -offworkAt $state.offwork_at
+        Add-HistoryLine -date $today -clockin $result.Value -offworkAt $state.offwork_at
     } else {
         # P1-2: 用发起日（state.date，周五）判断，周五 23:59 弹、周六 00:01 确认不再被吞
         if (-not (Test-WorkdayAt $ctx.WorkdayDate)) { return }
-        # R15: 确认回写（校验基准防串改；offwork_notified=$false 允许再次提醒；next_remind_at = 确认时间 + 间隔）
-        Invoke-OffworkConfirm -ExpectedOffworkAt $ctx.ExpectedOffworkAt -ConfirmedAt (Get-Date) -ReRemindIntervalMinutes $ctx.ReRemindIntervalMinutes
+        # v11: 输入时间 → datetime（跨天推断：输入早于上班时间 → +1 天，凌晨下班场景）
+        $workDate = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($ctx.WorkdayDate, 'yyyy-MM-dd', $null, [System.Globalization.DateTimeStyles]::None, [ref]$workDate)) { $workDate = (Get-Date).Date }
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact([string]$result.Value, [string[]]@('HH:mm', 'H:mm'), $null,
+                [System.Globalization.DateTimeStyles]::None, [ref]$t)) { return }
+        $dt = $workDate.Add($t.TimeOfDay)
+        $st = Read-State
+        if ($null -ne $st -and -not [string]::IsNullOrWhiteSpace([string]$st.clockin_time)) {
+            $ck = [datetime]::MinValue
+            if ([datetime]::TryParseExact([string]$st.clockin_time, [string[]]@('HH:mm', 'H:mm'), $null,
+                    [System.Globalization.DateTimeStyles]::None, [ref]$ck) -and $t.TimeOfDay -lt $ck.TimeOfDay) {
+                $dt = $dt.AddDays(1)
+            }
+        }
+        if ($result.Action -eq 'confirm') {
+            # v11: 确定下班 → 记录实际下班时间，结束提醒循环
+            Invoke-OffworkConfirm -ExpectedOffworkAt $ctx.ExpectedOffworkAt -ConfirmedAt $dt -ReRemindIntervalMinutes $ctx.ReRemindIntervalMinutes
+        } elseif ($result.Action -eq 'later') {
+            # v11: 稍后打卡 → 不写历史，按配置间隔安排下次提醒
+            Invoke-OffworkLater -ExpectedOffworkAt $ctx.ExpectedOffworkAt -AnchorAt $dt -ReRemindIntervalMinutes $ctx.ReRemindIntervalMinutes
+        }
     }
 } catch {
     Write-Log "弹窗确认回写失败: $($_.Exception.Message)"
@@ -1095,7 +1183,7 @@ try {
             Title = $Title
             Message = $Message
             SubMessage = $SubMessage
-            WithInput = ($Kind -eq 'work')
+            WithInput = $WithInput
             InputDefault = $InputDefault
             WorkWindowStart = $script:WorkWindowStart
             WorkWindowEnd = $WorkEnd
@@ -1225,7 +1313,12 @@ function Invoke-OffWorkCheck {
         $statLine += " ⚠️ 还差 $(Format-Duration (3000 - $wk.Weekday)) 达 50h"
     }
     $msg += "`n$statLine"
+    # v11: 下班弹窗两个按钮——确定下班（填当前时间，记录并结束提醒）/ 稍后打卡（填当前时间，按配置间隔再次提醒）
+    $subMsg = "确定下班：填当前时间，记录下班并结束提醒；稍后打卡：填当前时间，$($script:ReRemindIntervalMinutes) 分钟后再提醒"
     Start-DialogRunspace -Kind 'offwork' -Title '下班打卡提醒' -Message $msg `
+        -SubMessage $subMsg `
+        -WithInput $true `
+        -InputDefault $now.ToString('HH:mm') `
         -ExpectedOffworkAt $baseRaw `
         -WorkdayDate $state.date   # P1-2: 弹窗所属工作日（state.date），周五弹周六确认不被吞
 }
